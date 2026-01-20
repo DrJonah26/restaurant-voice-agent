@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# env files
+.env
+.env.local
+
+# secrets
+google-tts-key.json
+
+# build
+.next/
+dist/
