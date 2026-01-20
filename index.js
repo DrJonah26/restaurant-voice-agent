@@ -189,7 +189,9 @@ fastify.all("/incoming-call", async (req, reply) => {
     reply.type("text/xml").send(`
 <Response>
   <Connect>
-    <Stream url="wss://${req.headers.host}/media-stream?practice_id=${encodeURIComponent(practiceId)}" />
+    <Stream url="wss://${req.headers.host}/media-stream">
+      <Parameter name="practice_id" value="${encodeURIComponent(practiceId)}" />
+    </Stream>
   </Connect>
 </Response>
   `);
@@ -207,7 +209,7 @@ fastify.register(async (fastify) => {
         let dg = null;
         let processing = false;
 
-        const { practice_id: practiceId } = req.query || {};
+        let practiceId = req.query?.practice_id;
         let practiceSettings = null;
         let messages = [];
 
@@ -389,6 +391,7 @@ fastify.register(async (fastify) => {
                 streamSid = data.start.streamSid;
                 callActive = true;
                 console.log("🚀 Stream start:", streamSid);
+                practiceId = data.start?.customParameters?.practice_id || practiceId;
                 const init = await ensurePracticeSettings();
                 if (!init.ok) {
                     await speak("Es gab ein Konfigurationsproblem. Bitte versuchen Sie es später erneut.");
