@@ -70,8 +70,8 @@ async function getPracticeSettings(practiceId) {
 
     const { data, error } = await supabase
         .from("practice_settings")
-        .select("practice_id, restaurant_name, max_capacity, opening_time, closing_time")
-        .eq("practice_id", practiceId)
+        .select("id, restaurant_name, max_capacity, opening_time, closing_time")
+        .eq("id", practiceId)
         .maybeSingle();
 
     if (error) {
@@ -173,7 +173,7 @@ fastify.all("/incoming-call", async (req, reply) => {
     if (error || !settings) {
         reply.type("text/xml").send(`
 <Response>
-  <Say>Diese Praxis ist nicht verfügbar. Bitte versuchen Sie es später erneut.</Say>
+  <Say>Dieses Restaurant ist nicht verfügbar. Bitte versuchen Sie es später erneut.</Say>
   <Hangup/>
 </Response>
         `);
@@ -187,6 +187,7 @@ fastify.all("/incoming-call", async (req, reply) => {
   </Connect>
 </Response>
   `);
+  console.log(`📞 Incoming call for practice ${practiceId}`);
 });
 
 /* ───────────────────── MEDIA STREAM ───────────────────── */
