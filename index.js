@@ -14,23 +14,13 @@ dotenv.config();
 /* ───────────────────── CONFIG ───────────────────── */
 
 const PORT = process.env.PORT || 5050;
-const MAX_CAPACITY = 30;
-const today = new Date().toISOString().split("T")[0];
-
-// WICHTIG: Prompt verschärft, damit er nicht um Erlaubnis fragt
-const SYSTEM_MESSAGE =
-    fs.readFileSync("system_message.txt", "utf8") +
-    `\nHeute ist der ${today}. 
-    REGEL: Wenn der Kunde nach Verfügbarkeit fragt, rufe SOFORT 'check_availability' auf. Frage nicht "Soll ich nachsehen?", sondern mach es einfach.
-    Antworte kurz und prägnant. Wenn Uhrzeiten ohne Doppelpunkt erkannt werden (z.B. "18 30"),
-wandle sie IMMER in das Format HH:MM um (z.B. "18:30"),
-bevor du sie ausgibst oder weiterverarbeitest.`;
+const SYSTEM_MESSAGE_TEMPLATE = fs.readFileSync("system_message.txt", "utf8");
 
 /* ───────────────────── CLIENTS ───────────────────── */
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
-    process.env.SUPABASE_ANON_KEY
+    process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 const deepgram = createDeepgramClient(process.env.DEEPGRAM_API_KEY);
@@ -44,10 +34,62 @@ fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
 const ttsCache = new Map();
+const practiceCache = new Map();
+
+function formatTime(value) {
+    if (!value) return "";
+    if (typeof value === "string") return value.slice(0, 5);
+    return String(value).slice(0, 5);
+}
+
+function buildSystemMessage(practiceSettings) {
+    const today = new Date().toISOString().split("T")[0];
+    const openingTime = formatTime(practiceSettings.opening_time);
+    const closingTime = formatTime(practiceSettings.closing_time);
+    return (
+        SYSTEM_MESSAGE_TEMPLATE
+            .replaceAll("{{restaurant_name}}", practiceSettings.restaurant_name)
+            .replaceAll("{{opening_time}}", openingTime)
+            .replaceAll("{{closing_time}}", closingTime) +
+        `\nHeute ist der ${today}. 
+    REGEL: Wenn der Kunde nach Verfügbarkeit fragt, rufe SOFORT 'check_availability' auf. Frage nicht "Soll ich nachsehen?", sondern mach es einfach.
+    Antworte kurz und prägnant. Wenn Uhrzeiten ohne Doppelpunkt erkannt werden (z.B. "18 30"),
+wandle sie IMMER in das Format HH:MM um (z.B. "18:30"),
+bevor du sie ausgibst oder weiterverarbeitest.`
+    );
+}
+
+async function getPracticeSettings(practiceId) {
+    if (!practiceId) {
+        return { settings: null, error: "Missing practice_id" };
+    }
+
+    if (practiceCache.has(practiceId)) {
+        return { settings: practiceCache.get(practiceId), error: null };
+    }
+
+    const { data, error } = await supabase
+        .from("practice_settings")
+        .select("practice_id, restaurant_name, max_capacity, opening_time, closing_time")
+        .eq("practice_id", practiceId)
+        .maybeSingle();
+
+    if (error) {
+        console.error("❌ Practice Settings Error:", error);
+        return { settings: null, error: error.message };
+    }
+
+    if (!data) {
+        return { settings: null, error: "Practice not found" };
+    }
+
+    practiceCache.set(practiceId, data);
+    return { settings: data, error: null };
+}
 
 /* ───────────────────── DB FUNCTIONS ───────────────────── */
 
-async function checkAvailability(date, time, partySize) {
+async function checkAvailability(date, time, partySize, maxCapacity) {
     console.log(`🔎 DB CHECK: ${date} ${time} (${partySize} Pers)`);
     const { data, error } = await supabase
         .from("reservations")
@@ -62,13 +104,13 @@ async function checkAvailability(date, time, partySize) {
     }
 
     const used = data.reduce((s, r) => s + r.party_size, 0);
-    const isAvailable = MAX_CAPACITY - used >= partySize;
+    const isAvailable = maxCapacity - used >= partySize;
 
-    console.log(`✅ RESULT: ${isAvailable ? "FREI" : "VOLL"} (Belegt: ${used}/${MAX_CAPACITY})`);
+    console.log(`✅ RESULT: ${isAvailable ? "FREI" : "VOLL"} (Belegt: ${used}/${maxCapacity})`);
 
     return {
         available: isAvailable,
-        remaining: MAX_CAPACITY - used
+        remaining: maxCapacity - used
     };
 }
 
@@ -115,10 +157,33 @@ async function generateTTS(text) {
 /* ───────────────────── TWILIO ROUTES ───────────────────── */
 
 fastify.all("/incoming-call", async (req, reply) => {
+    const { practice_id: practiceId } = req.query || {};
+
+    if (!practiceId) {
+        reply.type("text/xml").send(`
+<Response>
+  <Say>Es gab ein Konfigurationsproblem. Bitte versuchen Sie es später erneut.</Say>
+  <Hangup/>
+</Response>
+        `);
+        return;
+    }
+
+    const { settings, error } = await getPracticeSettings(practiceId);
+    if (error || !settings) {
+        reply.type("text/xml").send(`
+<Response>
+  <Say>Diese Praxis ist nicht verfügbar. Bitte versuchen Sie es später erneut.</Say>
+  <Hangup/>
+</Response>
+        `);
+        return;
+    }
+
     reply.type("text/xml").send(`
 <Response>
   <Connect>
-    <Stream url="wss://${req.headers.host}/media-stream" />
+    <Stream url="wss://${req.headers.host}/media-stream?practice_id=${encodeURIComponent(practiceId)}" />
   </Connect>
 </Response>
   `);
@@ -127,7 +192,7 @@ fastify.all("/incoming-call", async (req, reply) => {
 /* ───────────────────── MEDIA STREAM ───────────────────── */
 
 fastify.register(async (fastify) => {
-    fastify.get("/media-stream", { websocket: true }, (connection) => {
+    fastify.get("/media-stream", { websocket: true }, (connection, req) => {
         console.log("📞 Call connected");
 
         let streamSid = null;
@@ -135,7 +200,21 @@ fastify.register(async (fastify) => {
         let dg = null;
         let processing = false;
 
-        let messages = [{ role: "system", content: SYSTEM_MESSAGE }];
+        const { practice_id: practiceId } = req.query || {};
+        let practiceSettings = null;
+        let messages = [];
+
+        async function ensurePracticeSettings() {
+            if (practiceSettings) return { ok: true };
+            const { settings, error } = await getPracticeSettings(practiceId);
+            if (error || !settings) {
+                console.error("❌ Practice Settings Missing:", error || "Not found");
+                return { ok: false };
+            }
+            practiceSettings = settings;
+            messages = [{ role: "system", content: buildSystemMessage(practiceSettings) }];
+            return { ok: true };
+        }
 
         /* ─────────────── DEEPGRAM ─────────────── */
         function startDeepgram() {
@@ -239,7 +318,12 @@ fastify.register(async (fastify) => {
                         let result;
 
                         if (tool.function.name === "check_availability") {
-                            result = await checkAvailability(args.date, args.time, args.party_size);
+                            result = await checkAvailability(
+                                args.date,
+                                args.time,
+                                args.party_size,
+                                practiceSettings.max_capacity
+                            );
                         } else if (tool.function.name === "create_reservation") {
                             result = await createReservation(args.date, args.time, args.party_size, args.name);
                         }
@@ -284,15 +368,24 @@ fastify.register(async (fastify) => {
 
         /* ─────────────── WEBSOCKET HANDLING ─────────────── */
 
-        connection.on("message", (msg) => {
+        connection.on("message", async (msg) => {
             const data = JSON.parse(msg);
 
             if (data.event === "start") {
                 streamSid = data.start.streamSid;
                 callActive = true;
                 console.log("🚀 Stream start:", streamSid);
+                const init = await ensurePracticeSettings();
+                if (!init.ok) {
+                    await speak("Es gab ein Konfigurationsproblem. Bitte versuchen Sie es später erneut.");
+                    connection.close();
+                    return;
+                }
                 startDeepgram();
-                setTimeout(() => speak("Restaurant Lindenhof, guten Tag. Wie kann ich helfen?"), 500);
+                setTimeout(
+                    () => speak(`${practiceSettings.restaurant_name}, guten Tag. Wie kann ich helfen?`),
+                    500
+                );
             }
 
             if (data.event === "media" && dg && dg.getReadyState() === 1) {
