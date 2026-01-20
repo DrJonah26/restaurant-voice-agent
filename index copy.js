@@ -193,7 +193,7 @@ fastify.all("/incoming-call", async (req, reply) => {
   </Connect>
 </Response>
   `);
-    console.log(`📞 Incoming call for practice ${practiceId}`);
+  console.log(`📞 Incoming call for practice ${practiceId}`);
 });
 
 /* ───────────────────── MEDIA STREAM ───────────────────── */
