@@ -48,7 +48,7 @@ function buildSystemMessage(practiceSettings) {
     const closingTime = formatTime(practiceSettings.closing_time);
     return (
         SYSTEM_MESSAGE_TEMPLATE
-            .replaceAll("{{restaurant_name}}", practiceSettings.restaurant_name)
+            .replaceAll("{{restaurant_name}}", practiceSettings.name)
             .replaceAll("{{opening_time}}", openingTime)
             .replaceAll("{{closing_time}}", closingTime) +
         `\nHeute ist der ${today}. 
@@ -69,8 +69,8 @@ async function getPracticeSettings(practiceId) {
     }
 
     const { data, error } = await supabase
-        .from("practice_settings")
-        .select("id, restaurant_name, max_capacity, opening_time, closing_time")
+        .from("practices")
+        .select("id, name, max_capacity, opening_time, closing_time")
         .eq("id", practiceId)
         .maybeSingle();
 
@@ -89,14 +89,15 @@ async function getPracticeSettings(practiceId) {
 
 /* ───────────────────── DB FUNCTIONS ───────────────────── */
 
-async function checkAvailability(date, time, partySize, maxCapacity) {
+async function checkAvailability(date, time, partySize, maxCapacity, practiceId) {
     console.log(`🔎 DB CHECK: ${date} ${time} (${partySize} Pers)`);
     const { data, error } = await supabase
         .from("reservations")
         .select("party_size")
         .eq("date", date)
         .eq("time", time)
-        .eq("status", "confirmed");
+        .eq("status", "confirmed")
+        .eq("practice_id", practiceId);
 
     if (error) {
         console.error("❌ DB Error:", error);
@@ -114,12 +115,17 @@ async function checkAvailability(date, time, partySize, maxCapacity) {
     };
 }
 
-async function createReservation(date, time, partySize, name) {
+async function createReservation(date, time, partySize, name, practiceId) {
     console.log(`📝 RESERVIERUNG: ${name}, ${date}, ${time}`);
     const { data, error } = await supabase
         .from("reservations")
         .insert({
-            date, time, party_size: partySize, customer_name: name, status: "confirmed"
+            date,
+            time,
+            party_size: partySize,
+            customer_name: name,
+            status: "confirmed",
+            practice_id: practiceId
         })
         .select();
 
@@ -173,7 +179,7 @@ fastify.all("/incoming-call", async (req, reply) => {
     if (error || !settings) {
         reply.type("text/xml").send(`
 <Response>
-  <Say>Dieses Restaurant ist nicht verfügbar. Bitte versuchen Sie es später erneut.</Say>
+  <Say>Diese Praxis ist nicht verfügbar. Bitte versuchen Sie es später erneut.</Say>
   <Hangup/>
 </Response>
         `);
@@ -323,10 +329,17 @@ fastify.register(async (fastify) => {
                                 args.date,
                                 args.time,
                                 args.party_size,
-                                practiceSettings.max_capacity
+                                practiceSettings.max_capacity,
+                                practiceSettings.id
                             );
                         } else if (tool.function.name === "create_reservation") {
-                            result = await createReservation(args.date, args.time, args.party_size, args.name);
+                            result = await createReservation(
+                                args.date,
+                                args.time,
+                                args.party_size,
+                                args.name,
+                                practiceSettings.id
+                            );
                         }
 
                         // Ergebnis in History speichern
@@ -384,7 +397,7 @@ fastify.register(async (fastify) => {
                 }
                 startDeepgram();
                 setTimeout(
-                    () => speak(`${practiceSettings.restaurant_name}, guten Tag. Wie kann ich helfen?`),
+                    () => speak(`${practiceSettings.name}, guten Tag. Wie kann ich helfen?`),
                     500
                 );
             }
