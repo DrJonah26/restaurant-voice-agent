@@ -234,7 +234,7 @@ fastify.register(async (fastify) => {
                 interim_results: true,
                 encoding: "mulaw",
                 sample_rate: 8000,
-                endpointing: 800,
+                endpointing: 900,
                 utterance_end_ms: 1000,
                 vad_events: true
             });
