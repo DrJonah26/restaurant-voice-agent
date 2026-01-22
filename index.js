@@ -135,6 +135,52 @@ async function createReservation(date, time, partySize, name, practiceId) {
     return { success: true, id: data[0].id };
 }
 
+async function createCallLog(practiceId, streamSid) {
+    if (!practiceId) return { success: false };
+    try {
+        const { data, error } = await supabase
+            .from("call_logs")
+            .insert({
+                practice_id: practiceId,
+                stream_sid: streamSid,
+                status: "started",
+                started_at: new Date().toISOString()
+            })
+            .select()
+            .maybeSingle();
+
+        if (error) {
+            console.warn("⚠️ Call Log Insert Error:", error.message);
+            return { success: false };
+        }
+
+        return { success: true, id: data?.id };
+    } catch (err) {
+        console.warn("⚠️ Call Log Insert Exception:", err);
+        return { success: false };
+    }
+}
+
+async function finalizeCallLog(callLogId, durationSeconds) {
+    if (!callLogId) return;
+    try {
+        const { error } = await supabase
+            .from("call_logs")
+            .update({
+                status: "ended",
+                ended_at: new Date().toISOString(),
+                duration_seconds: durationSeconds
+            })
+            .eq("id", callLogId);
+
+        if (error) {
+            console.warn("⚠️ Call Log Update Error:", error.message);
+        }
+    } catch (err) {
+        console.warn("⚠️ Call Log Update Exception:", err);
+    }
+}
+
 /* ───────────────────── GOOGLE TTS ───────────────────── */
 
 async function generateTTS(text) {
@@ -207,6 +253,8 @@ fastify.register(async (fastify) => {
         let callActive = false;
         let dg = null;
         let processing = false;
+        let callLogId = null;
+        let callStartedAt = null;
 
         let practiceId = req.query?.practice_id;
         let practiceSettings = null;
@@ -467,6 +515,9 @@ fastify.register(async (fastify) => {
                 const greeting = `${practiceSettings.name}, guten Tag. Wie kann ich helfen?`;
                 messages.push({ role: "assistant", content: greeting });
                 setTimeout(() => speak(greeting), 500);
+                callStartedAt = Date.now();
+                const callLog = await createCallLog(practiceId, streamSid);
+                callLogId = callLog.id || null;
             }
 
             if (data.event === "media" && dg && dg.getReadyState() === 1) {
@@ -478,12 +529,20 @@ fastify.register(async (fastify) => {
                 console.log("📞 Call ended");
                 callActive = false;
                 dg?.finish();
+                if (callStartedAt) {
+                    const durationSeconds = Math.max(0, Math.round((Date.now() - callStartedAt) / 1000));
+                    await finalizeCallLog(callLogId, durationSeconds);
+                }
             }
         });
 
         connection.on("close", () => {
             console.log("🔌 Connection closed");
             dg?.finish();
+            if (callStartedAt) {
+                const durationSeconds = Math.max(0, Math.round((Date.now() - callStartedAt) / 1000));
+                finalizeCallLog(callLogId, durationSeconds);
+            }
         });
     });
 });
