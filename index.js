@@ -263,6 +263,66 @@ fastify.register(async (fastify) => {
 
         /* ─────────────── REKURSIVE LLM LOGIK ─────────────── */
 
+        function shouldForceAvailabilityCall(text) {
+            if (!text) return false;
+            const lower = text.toLowerCase();
+            const hasCheckVerb = /überprüf|pr(ü|ue)f|nachseh|schau|check/.test(lower);
+            const hasAvailabilitySignal = /verf(ü|ue)gbar|frei|tisch/.test(lower);
+            return hasCheckVerb && hasAvailabilitySignal;
+        }
+
+        function hasAvailabilityInputs(history) {
+            const userTexts = history
+                .filter((message) => message.role === "user")
+                .map((message) => message.content || "");
+            const combined = userTexts.join(" ");
+
+            const hasDate = /\b(heute|morgen|übermorgen)\b/i.test(combined) ||
+                /\b\d{1,2}\.\s?\d{1,2}\.\b/.test(combined) ||
+                /\b\d{4}-\d{2}-\d{2}\b/.test(combined);
+            const hasTime = /\b\d{1,2}[:.]\d{2}\b/.test(combined) ||
+                /\b\d{1,2}\s?\d{2}\b/.test(combined) ||
+                /\b\d{1,2}\s?uhr\b/i.test(combined);
+            const hasPartySize = /\bfür\s?\d+\b/i.test(combined) ||
+                /\b\d+\s?(personen|leute|gäste)\b/i.test(combined);
+
+            return hasDate && hasTime && hasPartySize;
+        }
+
+        async function handleToolCalls(toolCalls) {
+            console.log("🛠️ Tool Call detected:", toolCalls.length);
+
+            for (const tool of toolCalls) {
+                const args = JSON.parse(tool.function.arguments);
+                let result;
+
+                if (tool.function.name === "check_availability") {
+                    result = await checkAvailability(
+                        args.date,
+                        args.time,
+                        args.party_size,
+                        practiceSettings.max_capacity,
+                        practiceSettings.id
+                    );
+                } else if (tool.function.name === "create_reservation") {
+                    result = await createReservation(
+                        args.date,
+                        args.time,
+                        args.party_size,
+                        args.name,
+                        practiceSettings.id
+                    );
+                }
+
+                // Ergebnis in History speichern
+                messages.push({
+                    role: "tool",
+                    tool_call_id: tool.id,
+                    content: JSON.stringify(result)
+                });
+            }
+        }
+
         async function processAgentTurn() {
             try {
                 // OpenAI Anfrage
@@ -319,42 +379,48 @@ fastify.register(async (fastify) => {
 
                 // 2. GIBT ES TOOL CALLS? -> AUSFÜHREN & REKURSION
                 if (msg.tool_calls) {
-                    console.log("🛠️ Tool Call detected:", msg.tool_calls.length);
-
-                    for (const tool of msg.tool_calls) {
-                        const args = JSON.parse(tool.function.arguments);
-                        let result;
-
-                        if (tool.function.name === "check_availability") {
-                            result = await checkAvailability(
-                                args.date,
-                                args.time,
-                                args.party_size,
-                                practiceSettings.max_capacity,
-                                practiceSettings.id
-                            );
-                        } else if (tool.function.name === "create_reservation") {
-                            result = await createReservation(
-                                args.date,
-                                args.time,
-                                args.party_size,
-                                args.name,
-                                practiceSettings.id
-                            );
-                        }
-
-                        // Ergebnis in History speichern
-                        messages.push({
-                            role: "tool",
-                            tool_call_id: tool.id,
-                            content: JSON.stringify(result)
-                        });
-                    }
+                    await handleToolCalls(msg.tool_calls);
 
                     // WICHTIG: Rekursiver Aufruf!
                     // Wir rufen OpenAI sofort wieder auf, damit es das Tool-Ergebnis verarbeitet
                     // und dem User die Antwort ("Ja ist frei") gibt.
                     await processAgentTurn();
+                    return;
+                }
+
+                if (!msg.tool_calls && (shouldForceAvailabilityCall(msg.content) || hasAvailabilityInputs(messages))) {
+                    const forcedRes = await openai.chat.completions.create({
+                        model: "gpt-4o-mini",
+                        messages,
+                        tools: [
+                            {
+                                type: "function",
+                                function: {
+                                    name: "check_availability",
+                                    description: "Prüft ob ein Tisch frei ist.",
+                                    parameters: {
+                                        type: "object",
+                                        properties: {
+                                            date: { type: "string", description: "Format YYYY-MM-DD" },
+                                            time: { type: "string", description: "Format HH:MM" },
+                                            party_size: { type: "number" }
+                                        },
+                                        required: ["date", "time", "party_size"]
+                                    }
+                                }
+                            }
+                        ],
+                        tool_choice: { type: "function", function: { name: "check_availability" } }
+                    });
+
+                    const forcedMsg = forcedRes.choices[0].message;
+                    messages.push(forcedMsg);
+
+                    if (forcedMsg.tool_calls) {
+                        await handleToolCalls(forcedMsg.tool_calls);
+                        await processAgentTurn();
+                    }
+                    return;
                 }
 
             } catch (err) {
@@ -398,10 +464,9 @@ fastify.register(async (fastify) => {
                     return;
                 }
                 startDeepgram();
-                setTimeout(
-                    () => speak(`${practiceSettings.name}, guten Tag. Wie kann ich helfen?`),
-                    500
-                );
+                const greeting = `${practiceSettings.name}, guten Tag. Wie kann ich helfen?`;
+                messages.push({ role: "assistant", content: greeting });
+                setTimeout(() => speak(greeting), 500);
             }
 
             if (data.event === "media" && dg && dg.getReadyState() === 1) {
