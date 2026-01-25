@@ -181,6 +181,26 @@ async function finalizeCallLog(callLogId, durationSeconds) {
     }
 }
 
+async function createTranscriptEntry(callLogId, role, content) {
+    if (!callLogId || !content) return;
+    try {
+        const { error } = await supabase
+            .from("call_transcripts")
+            .insert({
+                call_log_id: callLogId,
+                role,
+                content,
+                created_at: new Date().toISOString()
+            });
+
+        if (error) {
+            console.warn("⚠️ Transcript Insert Error:", error.message);
+        }
+    } catch (err) {
+        console.warn("⚠️ Transcript Insert Exception:", err);
+    }
+}
+
 /* ───────────────────── GOOGLE TTS ───────────────────── */
 
 async function generateTTS(text) {
@@ -298,6 +318,7 @@ fastify.register(async (fastify) => {
                         processing = true;
                         // User Nachricht hinzufügen
                         messages.push({ role: "user", content: text });
+                        await createTranscriptEntry(callLogId, "user", text);
                         // Rekursiven Prozess starten
                         await processAgentTurn();
                         processing = false;
@@ -423,6 +444,7 @@ fastify.register(async (fastify) => {
                 if (msg.content) {
                     console.log("🤖 AI:", msg.content);
                     await speak(msg.content);
+                    await createTranscriptEntry(callLogId, "assistant", msg.content);
                 }
 
                 // 2. GIBT ES TOOL CALLS? -> AUSFÜHREN & REKURSION
@@ -518,6 +540,7 @@ fastify.register(async (fastify) => {
                 callStartedAt = Date.now();
                 const callLog = await createCallLog(practiceId, streamSid);
                 callLogId = callLog.id || null;
+                await createTranscriptEntry(callLogId, "assistant", greeting);
             }
 
             if (data.event === "media" && dg && dg.getReadyState() === 1) {
