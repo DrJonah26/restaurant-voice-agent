@@ -35,10 +35,76 @@ fastify.register(fastifyWs);
 const ttsCache = new Map();
 const practiceCache = new Map();
 
+const WEEKDAY_MAP = {
+    sonntag: 0,
+    montag: 1,
+    dienstag: 2,
+    mittwoch: 3,
+    donnerstag: 4,
+    freitag: 5,
+    samstag: 6
+};
+
 function formatTime(value) {
     if (!value) return "";
     if (typeof value === "string") return value.slice(0, 5);
     return String(value).slice(0, 5);
+}
+
+function formatDate(date) {
+    return date.toLocaleDateString("sv-SE");
+}
+
+function parseIsoDate(dateStr) {
+    if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return null;
+    const [year, month, day] = dateStr.split("-").map(Number);
+    return new Date(year, month - 1, day);
+}
+
+function getWeekdayFromText(text) {
+    if (!text) return null;
+    const lower = text.toLowerCase();
+    const match = lower.match(/\b(sonntag|montag|dienstag|mittwoch|donnerstag|freitag|samstag)\b/);
+    if (!match) return null;
+    return WEEKDAY_MAP[match[1]];
+}
+
+function getNextWeekdayDate(targetWeekday, referenceDate, allowToday = false) {
+    const date = new Date(referenceDate.getFullYear(), referenceDate.getMonth(), referenceDate.getDate());
+    const currentWeekday = date.getDay();
+    let delta = (targetWeekday - currentWeekday + 7) % 7;
+    if (delta === 0 && !allowToday) {
+        delta = 7;
+    }
+    date.setDate(date.getDate() + delta);
+    return date;
+}
+
+function resolveWeekdayDate(dateStr, userText) {
+    const targetWeekday = getWeekdayFromText(userText);
+    if (targetWeekday === null) return dateStr;
+    const parsedDate = parseIsoDate(dateStr);
+    if (!parsedDate) return dateStr;
+    const today = new Date();
+    const todayDate = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const parsedDateOnly = new Date(parsedDate.getFullYear(), parsedDate.getMonth(), parsedDate.getDate());
+    if (parsedDate.getDay() === targetWeekday) {
+        if (parsedDateOnly.getTime() === todayDate.getTime()) {
+            const next = getNextWeekdayDate(targetWeekday, todayDate, false);
+            return formatDate(next);
+        }
+        return dateStr;
+    }
+    const next = getNextWeekdayDate(targetWeekday, new Date(), false);
+    return formatDate(next);
+}
+
+function isPastDate(dateStr) {
+    const parsedDate = parseIsoDate(dateStr);
+    if (!parsedDate) return false;
+    const today = new Date();
+    const todayDate = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    return parsedDate < todayDate;
 }
 
 function buildSystemMessage(practiceSettings) {
@@ -90,6 +156,10 @@ async function getPracticeSettings(practiceId) {
 
 async function checkAvailability(date, time, partySize, maxCapacity, practiceId) {
     console.log(`🔎 DB CHECK: ${date} ${time} (${partySize} Pers)`);
+    if (isPastDate(date)) {
+        console.warn(`⚠️ Past date rejected: ${date}`);
+        return { available: false, error: "Past date" };
+    }
     const { data, error } = await supabase
         .from("reservations")
         .select("party_size")
@@ -116,6 +186,10 @@ async function checkAvailability(date, time, partySize, maxCapacity, practiceId)
 
 async function createReservation(date, time, partySize, name, practiceId) {
     console.log(`📝 RESERVIERUNG: ${name}, ${date}, ${time}`);
+    if (isPastDate(date)) {
+        console.warn(`⚠️ Past date rejected: ${date}`);
+        return { success: false, error: "Past date" };
+    }
     const { data, error } = await supabase
         .from("reservations")
         .insert({
@@ -275,6 +349,7 @@ fastify.register(async (fastify) => {
         let processing = false;
         let callLogId = null;
         let callStartedAt = null;
+        let lastAvailabilityCheckIndex = 0;
 
         let practiceId = req.query?.practice_id;
         let practiceSettings = null;
@@ -340,8 +415,9 @@ fastify.register(async (fastify) => {
             return hasCheckVerb && hasAvailabilitySignal;
         }
 
-        function hasAvailabilityInputs(history) {
+        function hasAvailabilityInputs(history, sinceIndex = 0) {
             const userTexts = history
+                .slice(sinceIndex)
                 .filter((message) => message.role === "user")
                 .map((message) => message.content || "");
             const combined = userTexts.join(" ");
@@ -360,22 +436,25 @@ fastify.register(async (fastify) => {
 
         async function handleToolCalls(toolCalls) {
             console.log("🛠️ Tool Call detected:", toolCalls.length);
+            const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
 
             for (const tool of toolCalls) {
                 const args = JSON.parse(tool.function.arguments);
                 let result;
 
                 if (tool.function.name === "check_availability") {
+                    const resolvedDate = resolveWeekdayDate(args.date, lastUserMessage?.content || "");
                     result = await checkAvailability(
-                        args.date,
+                        resolvedDate,
                         args.time,
                         args.party_size,
                         practiceSettings.max_capacity,
                         practiceSettings.id
                     );
                 } else if (tool.function.name === "create_reservation") {
+                    const resolvedDate = resolveWeekdayDate(args.date, lastUserMessage?.content || "");
                     result = await createReservation(
-                        args.date,
+                        resolvedDate,
                         args.time,
                         args.party_size,
                         args.name,
@@ -389,6 +468,10 @@ fastify.register(async (fastify) => {
                     tool_call_id: tool.id,
                     content: JSON.stringify(result)
                 });
+
+                if (tool.function.name === "check_availability") {
+                    lastAvailabilityCheckIndex = messages.length;
+                }
             }
         }
 
@@ -458,7 +541,7 @@ fastify.register(async (fastify) => {
                     return;
                 }
 
-                if (!msg.tool_calls && (shouldForceAvailabilityCall(msg.content) || hasAvailabilityInputs(messages))) {
+                if (!msg.tool_calls && (shouldForceAvailabilityCall(msg.content) || hasAvailabilityInputs(messages, lastAvailabilityCheckIndex))) {
                     const forcedRes = await openai.chat.completions.create({
                         model: "gpt-4o-mini",
                         messages,
