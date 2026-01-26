@@ -95,7 +95,7 @@ function resolveWeekdayDate(dateStr, userText) {
         }
         return dateStr;
     }
-    const next = getNextWeekdayDate(targetWeekday, new Date(), false);
+    const next = getNextWeekdayDate(targetWeekday, parsedDateOnly, false);
     return formatDate(next);
 }
 
