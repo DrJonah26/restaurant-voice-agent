@@ -108,7 +108,14 @@ function isPastDate(dateStr) {
 }
 
 function buildSystemMessage(practiceSettings) {
-    const today = new Date().toISOString().split("T")[0];
+    const today = new Date();
+    const todayStr = today.toISOString().split("T")[0];
+    const weekdayName = today.toLocaleDateString("de-DE", { weekday: "long" });
+    const next7Days = Array.from({ length: 7 }, (_, i) => {
+        const d = new Date(today);
+        d.setDate(d.getDate() + i + 1);
+        return `${d.toLocaleDateString("de-DE", { weekday: "long" })}: ${d.toISOString().split("T")[0]}`;
+    }).join("\n");
     const openingTime = formatTime(practiceSettings.opening_time);
     const closingTime = formatTime(practiceSettings.closing_time);
     return (
@@ -116,9 +123,16 @@ function buildSystemMessage(practiceSettings) {
             .replaceAll("{{restaurant_name}}", practiceSettings.name)
             .replaceAll("{{opening_time}}", openingTime)
             .replaceAll("{{closing_time}}", closingTime) +
-        `\nHeute ist der ${today}. 
-    REGEL: Wenn der Kunde nach Verfügbarkeit fragt, rufe SOFORT 'check_availability' auf. Frage nicht "Soll ich nachsehen?", sondern mach es einfach.
-    Antworte kurz und prägnant. Wenn Uhrzeiten ohne Doppelpunkt erkannt werden (z.B. "18 30"),
+        `\nHEUTIGES DATUM: ${todayStr} (${weekdayName})
+
+WICHTIG - WOCHENTAGE RICHTIG INTERPRETIEREN:
+Wenn der Kunde einen Wochentag nennt, nutze diese Zuordnung:
+${next7Days}
+
+Beispiel: Sagt jemand "Donnerstag", verwende den kommenden Donnerstag aus der Liste (nicht heute, falls heute Donnerstag ist).
+
+REGEL: Wenn der Kunde nach Verfügbarkeit fragt, rufe SOFORT 'check_availability' auf. Frage nicht "Soll ich nachsehen?", sondern mach es einfach.
+Antworte kurz und prägnant. Wenn Uhrzeiten ohne Doppelpunkt erkannt werden (z.B. "18 30"),
 wandle sie IMMER in das Format HH:MM um (z.B. "18:30"),
 bevor du sie ausgibst oder weiterverarbeitest.`
     );
