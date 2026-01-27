@@ -384,7 +384,7 @@ fastify.register(async (fastify) => {
         /* ─────────────── DEEPGRAM ─────────────── */
         function startDeepgram() {
             dg = deepgram.listen.live({
-                model: "nova-2",
+                model: "nova-3",
                 language: "de",
                 smart_format: true,
                 interim_results: true,
