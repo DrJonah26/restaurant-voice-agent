@@ -25,6 +25,8 @@ const supabase = createClient(
 const deepgram = createDeepgramClient(process.env.DEEPGRAM_API_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();
+const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
+const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 
 /* ───────────────────── SERVER ───────────────────── */
 
@@ -34,6 +36,16 @@ fastify.register(fastifyWs);
 
 const ttsCache = new Map();
 const practiceCache = new Map();
+
+const RESERVATION_DURATION_MINUTES = 60;
+
+const HANDOFF_THRESHOLDS = {
+    misunderstandings: 2,
+    corrections: 2,
+    noProgressTurns: 3,
+    outOfHoursRepeats: 2,
+    toolErrors: 1
+};
 
 const WEEKDAY_MAP = {
     sonntag: 0,
@@ -55,10 +67,187 @@ function formatDate(date) {
     return date.toLocaleDateString("sv-SE");
 }
 
+function parseTimeToMinutes(value) {
+    if (value === null || value === undefined) return null;
+    const raw = String(value).trim().toLowerCase();
+    if (!raw) return null;
+    const trimmed = raw.replace(/\s*uhr$/, "");
+    const normalized = trimmed.replace(/\./g, ":").replace(/\s+/g, ":");
+    const hmsMatch = normalized.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+    if (hmsMatch) {
+        const hours = Number(hmsMatch[1]);
+        const minutes = Number(hmsMatch[2]);
+        if (Number.isNaN(hours) || Number.isNaN(minutes)) return null;
+        if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+        return hours * 60 + minutes;
+    }
+    const compactMatch = normalized.match(/^(\d{1,2})(\d{2})$/);
+    if (compactMatch) {
+        const hours = Number(compactMatch[1]);
+        const minutes = Number(compactMatch[2]);
+        if (Number.isNaN(hours) || Number.isNaN(minutes)) return null;
+        if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+        return hours * 60 + minutes;
+    }
+    const hourOnlyMatch = normalized.match(/^(\d{1,2})$/);
+    if (hourOnlyMatch) {
+        const hours = Number(hourOnlyMatch[1]);
+        if (Number.isNaN(hours) || hours < 0 || hours > 23) return null;
+        return hours * 60;
+    }
+    return null;
+}
+
+function computePeakOccupancy(reservations, requestedStart, partySize) {
+    const requestedEnd = requestedStart + RESERVATION_DURATION_MINUTES;
+    const events = [];
+
+    const addOverlapInterval = (start, end, size) => {
+        const overlapStart = Math.max(start, requestedStart);
+        const overlapEnd = Math.min(end, requestedEnd);
+        if (overlapStart >= overlapEnd) return;
+        events.push({ time: overlapStart, delta: size });
+        events.push({ time: overlapEnd, delta: -size });
+    };
+
+    for (const reservation of reservations || []) {
+        const resStart = parseTimeToMinutes(reservation.time);
+        if (resStart === null) continue;
+        const resSize = Number(reservation.party_size) || 0;
+        if (resSize <= 0) continue;
+        const resEnd = resStart + RESERVATION_DURATION_MINUTES;
+        addOverlapInterval(resStart, resEnd, resSize);
+    }
+
+    const newSize = Number(partySize) || 0;
+    if (newSize > 0) {
+        addOverlapInterval(requestedStart, requestedEnd, newSize);
+    }
+
+    if (events.length === 0) return 0;
+
+    events.sort((a, b) => {
+        if (a.time !== b.time) return a.time - b.time;
+        return a.delta - b.delta;
+    });
+
+    let current = 0;
+    let peak = 0;
+    for (const event of events) {
+        current += event.delta;
+        if (current > peak) peak = current;
+    }
+    return peak;
+}
+
 function parseIsoDate(dateStr) {
     if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return null;
     const [year, month, day] = dateStr.split("-").map(Number);
     return new Date(year, month - 1, day);
+}
+
+function decodeCustomParam(value) {
+    if (!value || typeof value !== "string") return null;
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
+}
+
+function normalizeText(text) {
+    return (text || "").toLowerCase();
+}
+
+function extractPartySizeFromText(text) {
+    if (!text) return null;
+    const sizeMatch = text.match(/\b(\d{1,2})\s*(personen|leute|g(?:a|\u00e4)ste|gaeste|pax)\b/i);
+    if (sizeMatch) return Number(sizeMatch[1]);
+    const fuerMatch = text.match(/\bf(ue|u)r\s*(\d{1,2})\b/i);
+    if (fuerMatch) return Number(fuerMatch[2]);
+    const sindMatch = text.match(/\bwir\s+sind\s+(\d{1,2})\b/i);
+    if (sindMatch) return Number(sindMatch[1]);
+    return null;
+}
+
+function isExplicitHandoffRequest(text) {
+    if (!text) return false;
+    return /(mitarbeiter|menschen|jemand(en)? sprechen|durchstell|weiterleit|verbinde|berater|chef)/i.test(text);
+}
+
+function isSpecialCaseRequest(text) {
+    if (!text) return false;
+    return /(storn|aend|aender|allerg|sonderwunsch|speisekarte|preise?|wegbeschreibung|anfahrt|adresse)/i.test(text);
+}
+
+function isCorrection(text) {
+    if (!text) return false;
+    return /\b(nein|falsch|korrigier|ich meinte|doch|anders|stimmt nicht|sorry|moment)\b/i.test(text);
+}
+
+function getConversationSignals(history, sinceIndex = 0) {
+    const userTexts = history
+        .slice(sinceIndex)
+        .filter((message) => message.role === "user")
+        .map((message) => message.content || "");
+    const combined = userTexts.join(" ");
+
+    const hasDate = /\b(heute|morgen|\u00fcbermorgen|uebermorgen)\b/i.test(combined) ||
+        /\b\d{1,2}\.\s?\d{1,2}\.\b/.test(combined) ||
+        /\b\d{4}-\d{2}-\d{2}\b/.test(combined);
+    const hasTime = /\b\d{1,2}[:.]\d{2}\b/.test(combined) ||
+        /\b\d{1,2}\s?\d{2}\b/.test(combined) ||
+        /\b\d{1,2}\s?uhr\b/i.test(combined);
+    const hasPartySize = /\bf(ue|u)r\s?\d+\b/i.test(combined) ||
+        /\b\d+\s?(personen|leute|g(?:a|\u00e4)ste|gaeste)\b/i.test(combined) ||
+        /\bwir\s+sind\s+\d+\b/i.test(combined);
+    const hasName = /\b(ich hei(?:ss|ß)e|mein name ist|name ist|auf den namen|ich bin)\b/i.test(combined);
+
+    return { hasDate, hasTime, hasPartySize, hasName };
+}
+
+function countMissingRequired(signals) {
+    const missing = [
+        !signals.hasDate,
+        !signals.hasTime,
+        !signals.hasPartySize,
+        !signals.hasName
+    ];
+    return missing.filter(Boolean).length;
+}
+
+function buildHandoffTwiml(phoneNumber) {
+    const safeNumber = String(phoneNumber || "").trim();
+    return `<Response><Dial>${safeNumber}</Dial></Response>`;
+}
+
+async function transferCallToNumber(callSid, phoneNumber) {
+    if (!twilioAccountSid || !twilioAuthToken) {
+        return { ok: false, error: "Missing Twilio credentials" };
+    }
+    if (!callSid || !phoneNumber) {
+        return { ok: false, error: "Missing callSid or phone number" };
+    }
+    const twiml = buildHandoffTwiml(phoneNumber);
+    const body = new URLSearchParams({ Twiml: twiml });
+    const auth = Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString("base64");
+    const response = await fetch(
+        `https://api.twilio.com/2010-04-01/Accounts/${twilioAccountSid}/Calls/${callSid}.json`,
+        {
+            method: "POST",
+            headers: {
+                Authorization: `Basic ${auth}`,
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body
+        }
+    );
+
+    if (!response.ok) {
+        const details = await response.text();
+        return { ok: false, error: details || `HTTP ${response.status}` };
+    }
+    return { ok: true };
 }
 
 function getWeekdayFromText(text) {
@@ -149,7 +338,7 @@ async function getPracticeSettings(practiceId) {
 
     const { data, error } = await supabase
         .from("practices")
-        .select("id, name, max_capacity, opening_time, closing_time")
+        .select("id, name, max_capacity, opening_time, closing_time, phone_number")
         .eq("id", practiceId)
         .maybeSingle();
 
@@ -174,11 +363,15 @@ async function checkAvailability(date, time, partySize, maxCapacity, practiceId)
         console.warn(`⚠️ Past date rejected: ${date}`);
         return { available: false, error: "Past date" };
     }
+    const requestedStart = parseTimeToMinutes(time);
+    if (requestedStart === null) {
+        console.warn(`Invalid time rejected: ${time}`);
+        return { available: false, error: "Invalid time" };
+    }
     const { data, error } = await supabase
         .from("reservations")
-        .select("party_size")
+        .select("party_size, time")
         .eq("date", date)
-        .eq("time", time)
         .eq("status", "confirmed")
         .eq("practice_id", practiceId);
 
@@ -187,8 +380,9 @@ async function checkAvailability(date, time, partySize, maxCapacity, practiceId)
         return { available: false, error: "Database error" };
     }
 
-    const used = data.reduce((s, r) => s + r.party_size, 0);
-    const isAvailable = maxCapacity - used >= partySize;
+    const peakOccupancy = computePeakOccupancy(data, requestedStart, partySize);
+    const used = peakOccupancy;
+    const isAvailable = used <= maxCapacity;
 
     console.log(`✅ RESULT: ${isAvailable ? "FREI" : "VOLL"} (Belegt: ${used}/${maxCapacity})`);
 
@@ -198,7 +392,7 @@ async function checkAvailability(date, time, partySize, maxCapacity, practiceId)
     };
 }
 
-async function createReservation(date, time, partySize, name, practiceId) {
+async function createReservation(date, time, partySize, name, practiceId, phoneNumber) {
     console.log(`📝 RESERVIERUNG: ${name}, ${date}, ${time}`);
     if (isPastDate(date)) {
         console.warn(`⚠️ Past date rejected: ${date}`);
@@ -211,6 +405,7 @@ async function createReservation(date, time, partySize, name, practiceId) {
             time,
             party_size: partySize,
             customer_name: name,
+            phone_number: phoneNumber || null,
             status: "confirmed",
             practice_id: practiceId
         })
@@ -317,6 +512,10 @@ async function generateTTS(text) {
 
 fastify.all("/incoming-call", async (req, reply) => {
     const { practice_id: practiceId } = req.query || {};
+    const callerPhone = typeof req.body?.From === "string"
+        ? req.body.From
+        : (typeof req.query?.From === "string" ? req.query.From : null);
+    const callerPhoneParam = callerPhone ? encodeURIComponent(callerPhone) : "";
 
     if (!practiceId) {
         reply.type("text/xml").send(`
@@ -344,6 +543,7 @@ fastify.all("/incoming-call", async (req, reply) => {
   <Connect>
     <Stream url="wss://${req.headers.host}/media-stream">
       <Parameter name="practice_id" value="${encodeURIComponent(practiceId)}" />
+      <Parameter name="caller_phone" value="${callerPhoneParam}" />
     </Stream>
   </Connect>
 </Response>
@@ -364,10 +564,118 @@ fastify.register(async (fastify) => {
         let callLogId = null;
         let callStartedAt = null;
         let lastAvailabilityCheckIndex = 0;
+        let callerPhone = null;
+        let callSid = null;
+
+        const handoffState = {
+            inProgress: false,
+            misunderstandings: 0,
+            corrections: 0,
+            noProgressTurns: 0,
+            outOfHoursRepeats: 0,
+            toolErrors: 0,
+            userTurns: 0,
+            lastSignals: null
+        };
+
+        const HANDOFF_MESSAGE = "Ich verbinde Sie jetzt mit einem Mitarbeiter.";
 
         let practiceId = req.query?.practice_id;
         let practiceSettings = null;
         let messages = [];
+
+        function updateProgressCounters() {
+            const signals = getConversationSignals(messages);
+            const missingCount = countMissingRequired(signals);
+            const lastSignals = handoffState.lastSignals;
+            const gainedInfo = lastSignals
+                ? (signals.hasDate && !lastSignals.hasDate) ||
+                  (signals.hasTime && !lastSignals.hasTime) ||
+                  (signals.hasPartySize && !lastSignals.hasPartySize) ||
+                  (signals.hasName && !lastSignals.hasName)
+                : false;
+
+            if (gainedInfo || missingCount < 2) {
+                handoffState.noProgressTurns = 0;
+            } else if (handoffState.userTurns >= 3) {
+                handoffState.noProgressTurns += 1;
+            }
+
+            handoffState.lastSignals = signals;
+        }
+
+        function evaluateHandoffForUserText(text) {
+            if (!text) return null;
+            if (isExplicitHandoffRequest(text)) return "user_request";
+            if (isSpecialCaseRequest(text)) return "special_case";
+
+            const partySize = extractPartySizeFromText(text);
+            if (partySize && partySize > 10) return "party_size_over_limit";
+
+            if (isCorrection(text)) {
+                handoffState.corrections += 1;
+            }
+
+            updateProgressCounters();
+
+            if (handoffState.corrections >= HANDOFF_THRESHOLDS.corrections) return "repeated_corrections";
+            if (handoffState.noProgressTurns >= HANDOFF_THRESHOLDS.noProgressTurns) return "no_progress";
+
+            return null;
+        }
+
+        function evaluateHandoffForAssistantText(text) {
+            if (!text) return null;
+            const lower = normalizeText(text);
+            if (lower.includes("nicht verstanden")) {
+                handoffState.misunderstandings += 1;
+            }
+            if (lower.includes("wir haben von")) {
+                handoffState.outOfHoursRepeats += 1;
+            }
+
+            if (handoffState.misunderstandings >= HANDOFF_THRESHOLDS.misunderstandings) return "misunderstandings";
+            if (handoffState.outOfHoursRepeats >= HANDOFF_THRESHOLDS.outOfHoursRepeats) return "out_of_hours";
+
+            return null;
+        }
+
+        async function initiateHandoff(reason) {
+            if (handoffState.inProgress || !callActive) return;
+            handoffState.inProgress = true;
+            console.log("ÐY\"z Handoff triggered:", reason);
+
+            const handoffText = HANDOFF_MESSAGE;
+            messages.push({ role: "assistant", content: handoffText });
+            await speak(handoffText);
+            await createTranscriptEntry(callLogId, "assistant", handoffText);
+
+            const targetNumber = practiceSettings?.phone_number;
+            if (!targetNumber) {
+                const fallbackText = "Es gibt ein technisches Problem. Bitte rufen Sie spaeter an.";
+                messages.push({ role: "assistant", content: fallbackText });
+                await speak(fallbackText);
+                await createTranscriptEntry(callLogId, "assistant", fallbackText);
+                return;
+            }
+
+            const transfer = await transferCallToNumber(callSid, targetNumber);
+            if (!transfer.ok) {
+                console.error("Handoff failed:", transfer.error);
+                const fallbackText = "Es gibt ein technisches Problem. Bitte rufen Sie spaeter an.";
+                messages.push({ role: "assistant", content: fallbackText });
+                await speak(fallbackText);
+                await createTranscriptEntry(callLogId, "assistant", fallbackText);
+            }
+
+            callActive = false;
+            dg?.finish();
+            try {
+                connection.close();
+            } catch (err) {
+                console.warn("Handoff close error:", err);
+            }
+        }
 
         async function ensurePracticeSettings() {
             if (practiceSettings) return { ok: true };
@@ -400,6 +708,7 @@ fastify.register(async (fastify) => {
             dg.on(LiveTranscriptionEvents.Transcript, async (data) => {
                 const text = data?.channel?.alternatives?.[0]?.transcript;
                 const isFinal = data?.is_final;
+                if (handoffState.inProgress) return;
 
                 if (text && isFinal && text.trim().length > 0) {
                     console.log("🎤 User:", text);
@@ -408,6 +717,13 @@ fastify.register(async (fastify) => {
                         // User Nachricht hinzufügen
                         messages.push({ role: "user", content: text });
                         await createTranscriptEntry(callLogId, "user", text);
+                        handoffState.userTurns += 1;
+                        const handoffReason = evaluateHandoffForUserText(text);
+                        if (handoffReason) {
+                            await initiateHandoff(handoffReason);
+                            processing = false;
+                            return;
+                        }
                         // Rekursiven Prozess starten
                         await processAgentTurn();
                         processing = false;
@@ -429,7 +745,7 @@ fastify.register(async (fastify) => {
             return hasCheckVerb && hasAvailabilitySignal;
         }
 
-        function hasAvailabilityInputs(history, sinceIndex = 0) {
+        function hasAvailabilityInputsLegacy(history, sinceIndex = 0) {
             const userTexts = history
                 .slice(sinceIndex)
                 .filter((message) => message.role === "user")
@@ -448,9 +764,15 @@ fastify.register(async (fastify) => {
             return hasDate && hasTime && hasPartySize;
         }
 
+        function hasAvailabilityInputs(history, sinceIndex = 0) {
+            const signals = getConversationSignals(history, sinceIndex);
+            return signals.hasDate && signals.hasTime && signals.hasPartySize;
+        }
+
         async function handleToolCalls(toolCalls) {
             console.log("🛠️ Tool Call detected:", toolCalls.length);
             const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
+            let handedOff = false;
 
             for (const tool of toolCalls) {
                 const args = JSON.parse(tool.function.arguments);
@@ -472,7 +794,8 @@ fastify.register(async (fastify) => {
                         args.time,
                         args.party_size,
                         args.name,
-                        practiceSettings.id
+                        practiceSettings.id,
+                        callerPhone
                     );
                 }
 
@@ -486,11 +809,26 @@ fastify.register(async (fastify) => {
                 if (tool.function.name === "check_availability") {
                     lastAvailabilityCheckIndex = messages.length;
                 }
+
+                if (result?.error && result.error !== "Past date") {
+                    handoffState.toolErrors += 1;
+                } else if (result?.success === false && result?.error) {
+                    handoffState.toolErrors += 1;
+                }
+
+                if (handoffState.toolErrors >= HANDOFF_THRESHOLDS.toolErrors) {
+                    await initiateHandoff("tool_error");
+                    handedOff = true;
+                    break;
+                }
             }
+
+            return { handedOff };
         }
 
         async function processAgentTurn() {
             try {
+                if (handoffState.inProgress) return;
                 // OpenAI Anfrage
                 const res = await openai.chat.completions.create({
                     model: "gpt-4o-mini",
@@ -544,9 +882,18 @@ fastify.register(async (fastify) => {
                     await createTranscriptEntry(callLogId, "assistant", msg.content);
                 }
 
+                if (msg.content) {
+                    const handoffReason = evaluateHandoffForAssistantText(msg.content);
+                    if (handoffReason) {
+                        await initiateHandoff(handoffReason);
+                        return;
+                    }
+                }
+
                 // 2. GIBT ES TOOL CALLS? -> AUSFÜHREN & REKURSION
                 if (msg.tool_calls) {
-                    await handleToolCalls(msg.tool_calls);
+                    const { handedOff } = await handleToolCalls(msg.tool_calls);
+                    if (handedOff) return;
 
                     // WICHTIG: Rekursiver Aufruf!
                     // Wir rufen OpenAI sofort wieder auf, damit es das Tool-Ergebnis verarbeitet
@@ -584,7 +931,8 @@ fastify.register(async (fastify) => {
                     messages.push(forcedMsg);
 
                     if (forcedMsg.tool_calls) {
-                        await handleToolCalls(forcedMsg.tool_calls);
+                        const { handedOff } = await handleToolCalls(forcedMsg.tool_calls);
+                        if (handedOff) return;
                         await processAgentTurn();
                     }
                     return;
@@ -592,6 +940,11 @@ fastify.register(async (fastify) => {
 
             } catch (err) {
                 console.error("❌ LLM Error:", err);
+                handoffState.toolErrors += 1;
+                if (handoffState.toolErrors >= HANDOFF_THRESHOLDS.toolErrors) {
+                    await initiateHandoff("llm_error");
+                    return;
+                }
                 await speak("Es gab leider einen Fehler. Bitte nochmal.");
             }
         }
@@ -622,8 +975,13 @@ fastify.register(async (fastify) => {
             if (data.event === "start") {
                 streamSid = data.start.streamSid;
                 callActive = true;
+                callSid = data.start?.callSid || data.start?.call_sid || null;
                 console.log("🚀 Stream start:", streamSid);
                 practiceId = data.start?.customParameters?.practice_id || practiceId;
+                const rawCallerPhone = data.start?.customParameters?.caller_phone
+                    || data.start?.customParameters?.from
+                    || data.start?.customParameters?.From;
+                callerPhone = decodeCustomParam(rawCallerPhone) || null;
                 const init = await ensurePracticeSettings();
                 if (!init.ok) {
                     await speak("Es gab ein Konfigurationsproblem. Bitte versuchen Sie es später erneut.");
@@ -670,3 +1028,4 @@ fastify.register(async (fastify) => {
 fastify.listen({ port: PORT, host: "0.0.0.0" }, () => {
     console.log(`✅ Server running on port ${PORT}`);
 });
+
