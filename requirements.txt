@@ -1,4 +1,0 @@
-pipecat-ai==0.0.50
-python-dotenv==1.0.0
-asyncio
-websockets
