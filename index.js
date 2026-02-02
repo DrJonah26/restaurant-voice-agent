@@ -39,9 +39,15 @@ const practiceCache = new Map();
 
 const RESERVATION_DURATION_MINUTES = 60;
 
+const ACCESS_DENIED_MESSAGES = {
+    expired: "Dieses Restaurant ist derzeit nicht verfügbar. Bitte versuchen Sie es später erneut.",
+    limit_exceeded: "Das monatliche Anruflimit wurde erreicht. Bitte versuchen Sie es später erneut.",
+    default: "Dieses Restaurant ist derzeit nicht verfügbar. Bitte versuchen Sie es später erneut."
+};
+
 const HANDOFF_THRESHOLDS = {
-    misunderstandings: 2,
-    corrections: 2,
+    misunderstandings: 3,
+    corrections: 3,
     noProgressTurns: 3,
     outOfHoursRepeats: 2,
     toolErrors: 1
@@ -146,6 +152,14 @@ function parseIsoDate(dateStr) {
     return new Date(year, month - 1, day);
 }
 
+function getUtcMonthRange(date = new Date()) {
+    const year = date.getUTCFullYear();
+    const month = date.getUTCMonth();
+    const start = new Date(Date.UTC(year, month, 1, 0, 0, 0));
+    const end = new Date(Date.UTC(year, month + 1, 1, 0, 0, 0));
+    return { startIso: start.toISOString(), endIso: end.toISOString() };
+}
+
 function decodeCustomParam(value) {
     if (!value || typeof value !== "string") return null;
     try {
@@ -219,6 +233,11 @@ function countMissingRequired(signals) {
 function buildHandoffTwiml(phoneNumber) {
     const safeNumber = String(phoneNumber || "").trim();
     return `<Response><Dial>${safeNumber}</Dial></Response>`;
+}
+
+function buildAccessDeniedTwiml(message) {
+    const safeMessage = message || ACCESS_DENIED_MESSAGES.default;
+    return `<Response><Say language="de-DE">${safeMessage}</Say><Hangup/></Response>`;
 }
 
 async function transferCallToNumber(callSid, phoneNumber) {
@@ -327,18 +346,18 @@ bevor du sie ausgibst oder weiterverarbeitest.`
     );
 }
 
-async function getPracticeSettings(practiceId) {
+async function getPracticeSettings(practiceId, { bypassCache = false } = {}) {
     if (!practiceId) {
         return { settings: null, error: "Missing practice_id" };
     }
 
-    if (practiceCache.has(practiceId)) {
+    if (!bypassCache && practiceCache.has(practiceId)) {
         return { settings: practiceCache.get(practiceId), error: null };
     }
 
     const { data, error } = await supabase
         .from("practices")
-        .select("id, name, max_capacity, opening_time, closing_time, phone_number")
+        .select("id, name, max_capacity, opening_time, closing_time, phone_number, subscription_status, calls_limit")
         .eq("id", practiceId)
         .maybeSingle();
 
@@ -353,6 +372,59 @@ async function getPracticeSettings(practiceId) {
 
     practiceCache.set(practiceId, data);
     return { settings: data, error: null };
+}
+
+async function getMonthlyCallCount(practiceId, now = new Date()) {
+    if (!practiceId) return { count: null, error: "Missing practice_id" };
+    const { startIso, endIso } = getUtcMonthRange(now);
+    const { count, error } = await supabase
+        .from("call_logs")
+        .select("id", { count: "exact", head: true })
+        .eq("practice_id", practiceId)
+        .gte("started_at", startIso)
+        .lt("started_at", endIso);
+
+    if (error) {
+        console.warn("Call count error:", error.message);
+        return { count: null, error: error.message };
+    }
+
+    return { count: count ?? 0, error: null };
+}
+
+function isSubscriptionExpired(status) {
+    return String(status || "").trim().toLowerCase() === "expired";
+}
+
+async function checkPracticeAccess(practiceId) {
+    const { settings, error } = await getPracticeSettings(practiceId, { bypassCache: true });
+    if (error || !settings) {
+        return { allowed: false, reason: "not_found", message: ACCESS_DENIED_MESSAGES.default, settings: null };
+    }
+
+    if (isSubscriptionExpired(settings.subscription_status)) {
+        return { allowed: false, reason: "expired", message: ACCESS_DENIED_MESSAGES.expired, settings };
+    }
+
+    const callsLimit = Number(settings.calls_limit);
+    if (Number.isFinite(callsLimit) && callsLimit > 0) {
+        const { count, error: countError } = await getMonthlyCallCount(practiceId);
+        if (countError) {
+            return { allowed: false, reason: "limit_check_failed", message: ACCESS_DENIED_MESSAGES.default, settings };
+        }
+        if ((count ?? 0) >= callsLimit) {
+            return {
+                allowed: false,
+                reason: "limit_exceeded",
+                message: ACCESS_DENIED_MESSAGES.limit_exceeded,
+                settings,
+                callsCount: count ?? 0,
+                callsLimit
+            };
+        }
+    }
+
+    return { allowed: true, settings };
 }
 
 /* ───────────────────── DB FUNCTIONS ───────────────────── */
@@ -518,23 +590,20 @@ fastify.all("/incoming-call", async (req, reply) => {
     const callerPhoneParam = callerPhone ? encodeURIComponent(callerPhone) : "";
 
     if (!practiceId) {
-        reply.type("text/xml").send(`
-<Response>
-  <Say>Es gab ein Konfigurationsproblem. Bitte versuchen Sie es später erneut.</Say>
-  <Hangup/>
-</Response>
-        `);
+        reply.type("text/xml").send(
+            buildAccessDeniedTwiml("Es gab ein Konfigurationsproblem. Bitte versuchen Sie es spaeter erneut.")
+        );
         return;
     }
 
-    const { settings, error } = await getPracticeSettings(practiceId);
-    if (error || !settings) {
-        reply.type("text/xml").send(`
-<Response>
-  <Say>Diese Praxis ist nicht verfügbar. Bitte versuchen Sie es später erneut.</Say>
-  <Hangup/>
-</Response>
-        `);
+    const access = await checkPracticeAccess(practiceId);
+    if (!access.allowed) {
+        const forwardNumber = access.settings?.phone_number;
+        if (forwardNumber) {
+            reply.type("text/xml").send(buildHandoffTwiml(forwardNumber));
+        } else {
+            reply.type("text/xml").send(buildAccessDeniedTwiml(access.message));
+        }
         return;
     }
 
@@ -679,12 +748,16 @@ fastify.register(async (fastify) => {
 
         async function ensurePracticeSettings() {
             if (practiceSettings) return { ok: true };
-            const { settings, error } = await getPracticeSettings(practiceId);
-            if (error || !settings) {
-                console.error("❌ Practice Settings Missing:", error || "Not found");
-                return { ok: false };
+            const access = await checkPracticeAccess(practiceId);
+            if (!access.allowed || !access.settings) {
+                console.error("Practice Access Denied:", access.reason || "Not allowed");
+                return {
+                    ok: false,
+                    message: access.message || ACCESS_DENIED_MESSAGES.default,
+                    forwardToNumber: access.settings?.phone_number || null
+                };
             }
-            practiceSettings = settings;
+            practiceSettings = access.settings;
             messages = [{ role: "system", content: buildSystemMessage(practiceSettings) }];
             return { ok: true };
         }
@@ -984,7 +1057,9 @@ fastify.register(async (fastify) => {
                 callerPhone = decodeCustomParam(rawCallerPhone) || null;
                 const init = await ensurePracticeSettings();
                 if (!init.ok) {
-                    await speak("Es gab ein Konfigurationsproblem. Bitte versuchen Sie es später erneut.");
+                    if (init.forwardToNumber && callSid) {
+                        await transferCallToNumber(callSid, init.forwardToNumber);
+                    }
                     connection.close();
                     return;
                 }
