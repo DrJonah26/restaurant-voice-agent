@@ -10,11 +10,12 @@ import textToSpeech from "@google-cloud/text-to-speech";
 
 dotenv.config();
 
-if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+if (process.env.GOOGLE_TTS_CREDENTIALS) {
     const ttsKeyPath = "/tmp/google-tts-key.json";
     try {
-        fs.writeFileSync(ttsKeyPath, process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON, "utf8");
+        fs.writeFileSync(ttsKeyPath, process.env.GOOGLE_TTS_CREDENTIALS, "utf8");
         process.env.GOOGLE_APPLICATION_CREDENTIALS = ttsKeyPath;
+        console.log("✅ Google TTS credentials loaded");
     } catch (err) {
         console.error("Failed to write Google TTS credentials file:", err);
     }
