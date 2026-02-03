@@ -647,7 +647,15 @@ async function generateTTS(text) {
 /* --------------------- TWILIO ROUTES --------------------- */
 
 fastify.all("/incoming-call", async (req, reply) => {
-    const { practice_id: practiceId, caller_phone: callerPhone } = req.query || {};
+    const { practice_id: practiceId } = req.query || {};
+    const rawCallerPhone = req.query?.caller_phone
+        ?? req.body?.caller_phone
+        ?? req.body?.From
+        ?? req.body?.from
+        ?? req.query?.From
+        ?? req.query?.from
+        ?? null;
+    const callerPhone = decodeCustomParam(rawCallerPhone);
 
     if (!practiceId) {
         reply.type("text/xml").send(`
@@ -670,7 +678,7 @@ fastify.all("/incoming-call", async (req, reply) => {
         return;
     }
 
-    const callerPhoneParam = callerPhone ? encodeURIComponent(callerPhone) : "";
+    const callerPhoneParam = callerPhone ? encodeURIComponent(String(callerPhone).trim()) : "";
 
     reply.type("text/xml").send(`
 <Response>
