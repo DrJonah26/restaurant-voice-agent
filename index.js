@@ -297,8 +297,23 @@ function countMissingRequired(signals) {
     return missing.filter(Boolean).length;
 }
 
+function normalizePhoneNumber(value) {
+    if (!value) return null;
+    const raw = String(value).trim().replace(/^tel:/i, "");
+    const compact = raw.replace(/[\s().-]/g, "");
+    if (!compact) return null;
+
+    const normalized = compact.startsWith("+")
+        ? `+${compact.slice(1).replace(/\+/g, "")}`
+        : compact.replace(/\+/g, "");
+    const digits = normalized.replace(/\D/g, "");
+    if (digits.length < 6) return null;
+    return normalized;
+}
+
 function buildHandoffTwiml(phoneNumber) {
-    const safeNumber = String(phoneNumber || "").trim();
+    const safeNumber = normalizePhoneNumber(phoneNumber);
+    if (!safeNumber) return "";
     return `<Response><Dial>${safeNumber}</Dial></Response>`;
 }
 
@@ -311,10 +326,11 @@ async function transferCallToNumber(callSid, phoneNumber) {
     if (!twilioAccountSid || !twilioAuthToken) {
         return { ok: false, error: "Missing Twilio credentials" };
     }
-    if (!callSid || !phoneNumber) {
+    const targetNumber = normalizePhoneNumber(phoneNumber);
+    if (!callSid || !targetNumber) {
         return { ok: false, error: "Missing callSid or phone number" };
     }
-    const twiml = buildHandoffTwiml(phoneNumber);
+    const twiml = buildHandoffTwiml(targetNumber);
     const body = new URLSearchParams({ Twiml: twiml });
     const auth = Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString("base64");
     const response = await fetch(
@@ -669,7 +685,7 @@ fastify.all("/incoming-call", async (req, reply) => {
 
     const access = await checkPracticeAccess(practiceId);
     if (!access.allowed) {
-        const forwardNumber = access.settings?.phone_number || null;
+        const forwardNumber = normalizePhoneNumber(access.settings?.phone_number);
         if (forwardNumber) {
             reply.type("text/xml").send(buildHandoffTwiml(forwardNumber));
         } else {
@@ -715,7 +731,7 @@ fastify.register(async (fastify) => {
             consecutiveMisunderstandings: 0
         };
 
-        const HANDOFF_MESSAGE = "Ich verbinde sie mit einem Mitarbeiter.";
+        const HANDOFF_MESSAGE = "Ich verbinde Sie zurueck mit dem Restaurant.";
         const HANDOFF_CONFIRM_MESSAGE = "M\u00f6chten Sie zu einem Mitarbeiter weitergeleitet werden?";
 
         let practiceId = req.query?.practice_id;
@@ -777,12 +793,13 @@ fastify.register(async (fastify) => {
             await speak(handoffText);
             await createTranscriptEntry(callLogId, "assistant", handoffText);
 
-            const targetNumber = practiceSettings?.phone_number;
+            const targetNumber = normalizePhoneNumber(practiceSettings?.phone_number);
             if (!targetNumber) {
                 const fallbackText = "Es gibt ein technisches Problem. Bitte rufen Sie spaeter an.";
                 messages.push({ role: "assistant", content: fallbackText });
                 await speak(fallbackText);
                 await createTranscriptEntry(callLogId, "assistant", fallbackText);
+                handoffState.inProgress = false;
                 return;
             }
 
@@ -793,15 +810,10 @@ fastify.register(async (fastify) => {
                 messages.push({ role: "assistant", content: fallbackText });
                 await speak(fallbackText);
                 await createTranscriptEntry(callLogId, "assistant", fallbackText);
+                handoffState.inProgress = false;
+                return;
             }
-
-            callActive = false;
-            dg?.finish();
-            try {
-                connection.close();
-            } catch (err) {
-                console.warn("Handoff close error:", err);
-            }
+            console.log("Handoff transfer accepted by Twilio");
         }
 
         async function ensurePracticeSettings() {
@@ -812,7 +824,7 @@ fastify.register(async (fastify) => {
                 return {
                     ok: false,
                     message: access.message || ACCESS_DENIED_MESSAGES.default,
-                    forwardToNumber: access.settings?.phone_number || null
+                    forwardToNumber: normalizePhoneNumber(access.settings?.phone_number)
                 };
             }
             practiceSettings = access.settings;
@@ -849,6 +861,11 @@ fastify.register(async (fastify) => {
                         messages.push({ role: "user", content: text });
                         await createTranscriptEntry(callLogId, "user", text);
                         if (await handleHandoffConfirmation(text)) {
+                            processing = false;
+                            return;
+                        }
+                        if (isExplicitHandoffRequest(text)) {
+                            await initiateHandoff("explicit_user_request");
                             processing = false;
                             return;
                         }
