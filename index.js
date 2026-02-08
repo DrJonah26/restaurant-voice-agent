@@ -49,6 +49,7 @@ const ttsCache = new Map();
 const practiceCache = new Map();
 
 const RESERVATION_DURATION_MINUTES = 60;
+const NOTIFICATION_RETRY_DELAYS_MS = [500, 1000, 2000, 4000, 8000];
 
 const ACCESS_DENIED_MESSAGES = {
     expired: "Dieses Restaurant ist derzeit nicht verf\u00fcgbar. Bitte versuchen Sie es sp\u00e4ter erneut.",
@@ -79,6 +80,11 @@ function formatTime(value) {
 function formatDate(date) {
     return date.toLocaleDateString("sv-SE");
 }
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function parseTimeToMinutes(value) {
     if (value === null || value === undefined) return null;
     const raw = String(value).trim().toLowerCase();
@@ -542,6 +548,68 @@ async function checkAvailability(date, time, partySize, maxCapacity, practiceId)
     };
 }
 
+async function notifyReservationCreatedWithRetry(reservationId) {
+    const baseUrl = process.env.APP_API_BASE_URL;
+    const internalApiSecret = process.env.INTERNAL_API_SECRET;
+
+    if (!reservationId) {
+        return { success: false, skipped: true, reason: "missing_reservation_id" };
+    }
+    if (!baseUrl) {
+        console.warn("Notification skipped: APP_API_BASE_URL is not set");
+        return { success: false, skipped: true, reason: "missing_app_api_base_url" };
+    }
+    if (!internalApiSecret) {
+        console.warn("Notification skipped: INTERNAL_API_SECRET is not set");
+        return { success: false, skipped: true, reason: "missing_internal_api_secret" };
+    }
+
+    const normalizedBaseUrl = String(baseUrl).replace(/\/+$/, "");
+    const url = `${normalizedBaseUrl}/api/internal/notifications/reservation-created`;
+    const requestOptions = {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${internalApiSecret}`
+        },
+        body: JSON.stringify({ reservationId })
+    };
+
+    let lastErrorMessage = "Notification request failed";
+
+    for (let attempt = 0; attempt <= NOTIFICATION_RETRY_DELAYS_MS.length; attempt++) {
+        try {
+            const response = await fetch(url, requestOptions);
+
+            if (response.ok) {
+                return { success: true, status: response.status };
+            }
+
+            const details = (await response.text()).trim();
+            const statusError = details ? `HTTP ${response.status}: ${details}` : `HTTP ${response.status}`;
+            lastErrorMessage = statusError;
+
+            if (response.status >= 400 && response.status < 500) {
+                console.warn(`Notification failed without retry: ${statusError}`);
+                return { success: false, status: response.status, retryable: false, error: statusError };
+            }
+
+            if (response.status < 500 || response.status > 599) {
+                console.warn(`Notification failed without retry: ${statusError}`);
+                return { success: false, status: response.status, retryable: false, error: statusError };
+            }
+        } catch (error) {
+            lastErrorMessage = error?.message || String(error);
+        }
+
+        if (attempt === NOTIFICATION_RETRY_DELAYS_MS.length) break;
+        await sleep(NOTIFICATION_RETRY_DELAYS_MS[attempt]);
+    }
+
+    console.warn(`Notification failed after retries: ${lastErrorMessage}`);
+    return { success: false, retryable: true, error: lastErrorMessage };
+}
+
 async function createReservation(date, time, partySize, name, practiceId, phoneNumber) {
     console.log(`\uD83D\uDCDD RESERVIERUNG: ${name}, ${date}, ${time}`);
     if (isPastDate(date)) {
@@ -565,7 +633,18 @@ async function createReservation(date, time, partySize, name, practiceId, phoneN
         console.error("\u274c Reservation Error:", error);
         return { success: false, error: error.message };
     }
-    return { success: true, id: data[0].id };
+    const reservationId = data?.[0]?.id;
+    if (!reservationId) {
+        console.error("Reservation insert succeeded but no reservation id was returned");
+        return { success: false, error: "Reservation id missing" };
+    }
+
+    const notificationResult = await notifyReservationCreatedWithRetry(reservationId);
+    if (!notificationResult.success && !notificationResult.skipped) {
+        console.warn(`Reservation notification error: ${notificationResult.error || "unknown error"}`);
+    }
+
+    return { success: true, id: reservationId };
 }
 
 async function createCallLog(practiceId, streamSid) {
