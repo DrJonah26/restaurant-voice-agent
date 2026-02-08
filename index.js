@@ -70,6 +70,126 @@ const WEEKDAY_MAP = {
     freitag: 5,
     samstag: 6
 };
+const WEEKDAY_LABELS = ["Sonntag", "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag"];
+const WEEKDAY_TOKEN_MAP = {
+    sonntag: 0,
+    montag: 1,
+    dienstag: 2,
+    mittwoch: 3,
+    donnerstag: 4,
+    freitag: 5,
+    samstag: 6,
+    so: 0,
+    mo: 1,
+    di: 2,
+    mi: 3,
+    do: 4,
+    fr: 5,
+    sa: 6,
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6,
+    sun: 0,
+    mon: 1,
+    tue: 2,
+    tues: 2,
+    wed: 3,
+    thu: 4,
+    thur: 4,
+    thurs: 4,
+    fri: 5,
+    sat: 6
+};
+
+function parseClosedDaysRaw(value) {
+    if (Array.isArray(value)) return value;
+    if (typeof value !== "string") return [];
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return parsed;
+    } catch {
+        // Fall through and parse as delimited string.
+    }
+    return trimmed
+        .replace(/[{}\[\]"']/g, "")
+        .split(",")
+        .map((token) => token.trim())
+        .filter(Boolean);
+}
+
+function normalizeWeekdayToken(value) {
+    return String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[.\-_/]/g, "")
+        .replace(/\s+/g, "")
+        .replace(/\u00e4/g, "ae")
+        .replace(/\u00f6/g, "oe")
+        .replace(/\u00fc/g, "ue")
+        .replace(/\u00df/g, "ss");
+}
+
+function normalizeClosedDays(value) {
+    const rawDays = parseClosedDaysRaw(value);
+    const normalized = new Set();
+
+    for (const rawDay of rawDays) {
+        if (typeof rawDay === "number" && Number.isInteger(rawDay) && rawDay >= 0 && rawDay <= 6) {
+            normalized.add(rawDay);
+            continue;
+        }
+
+        if (typeof rawDay === "string") {
+            const numeric = Number(rawDay);
+            if (Number.isInteger(numeric) && numeric >= 0 && numeric <= 6) {
+                normalized.add(numeric);
+                continue;
+            }
+            const token = normalizeWeekdayToken(rawDay);
+            const mapped = WEEKDAY_TOKEN_MAP[token];
+            if (Number.isInteger(mapped)) {
+                normalized.add(mapped);
+            }
+        }
+    }
+
+    return Array.from(normalized).sort((a, b) => a - b);
+}
+
+function getClosedDayDetails(dateStr, closedDaysRaw) {
+    const closedDayIndexes = normalizeClosedDays(closedDaysRaw);
+    const parsedDate = parseIsoDate(dateStr);
+    if (!parsedDate) {
+        return {
+            isClosed: false,
+            requestedDayName: null,
+            closedDayNames: closedDayIndexes.map((day) => WEEKDAY_LABELS[day]),
+            otherClosedDayNames: [],
+            closedDayIndexes
+        };
+    }
+
+    const requestedDayIndex = parsedDate.getDay();
+    const requestedDayName = WEEKDAY_LABELS[requestedDayIndex];
+    const closedDayNames = closedDayIndexes.map((day) => WEEKDAY_LABELS[day]);
+    const otherClosedDayNames = closedDayIndexes
+        .filter((day) => day !== requestedDayIndex)
+        .map((day) => WEEKDAY_LABELS[day]);
+
+    return {
+        isClosed: closedDayIndexes.includes(requestedDayIndex),
+        requestedDayName,
+        closedDayNames,
+        otherClosedDayNames,
+        closedDayIndexes
+    };
+}
 
 function formatTime(value) {
     if (!value) return "";
@@ -431,15 +551,24 @@ function buildSystemMessage(practiceSettings) {
     }).join("\n");
     const openingTime = formatTime(practiceSettings.opening_time);
     const closingTime = formatTime(practiceSettings.closing_time);
+    const closedDayIndexes = normalizeClosedDays(practiceSettings.closed_days);
+    const closedDaysSummary = closedDayIndexes.length > 0
+        ? closedDayIndexes.map((day) => WEEKDAY_LABELS[day]).join(", ")
+        : "Keine";
     return (
         SYSTEM_MESSAGE_TEMPLATE
             .replaceAll("{{restaurant_name}}", practiceSettings.name)
             .replaceAll("{{opening_time}}", openingTime)
             .replaceAll("{{closing_time}}", closingTime) +
+        `\nGESCHLOSSENE TAGE: ${closedDaysSummary}\n` +
         `\nHEUTIGES DATUM: ${todayStr} (${weekdayName})\n\n` +
         `WICHTIG - WOCHENTAGE RICHTIG INTERPRETIEREN:\n` +
         `Wenn der Kunde einen Wochentag nennt, nutze diese Zuordnung:\n${next7Days}\n\n` +
         `Beispiel: Sagt jemand "Donnerstag", verwende den kommenden Donnerstag aus der Liste (nicht heute, falls heute Donnerstag ist).\n\n` +
+        `WICHTIG: Wenn ein Tool-Ergebnis is_closed_day=true zurueckgibt,\n` +
+        `sage klar, dass das Restaurant am angefragten Tag geschlossen ist,\n` +
+        `nenne auch die weiteren geschlossenen Tage aus other_closed_days (falls vorhanden)\n` +
+        `und frage direkt nach einem neuen Termin.\n\n` +
         `REGEL: Wenn der Kunde nach Verf\u00fcgbarkeit fragt, rufe SOFORT 'check_availability' auf. Frage nicht "Soll ich nachsehen?", sondern mach es einfach.\n` +
         `Antworte kurz und pr\u00e4gnant. Wenn Uhrzeiten ohne Doppelpunkt erkannt werden (z.B. "18 30"),\n` +
         `wandle sie IMMER in das Format HH:MM um (z.B. "18:30"),\n` +
@@ -457,7 +586,7 @@ async function getPracticeSettings(practiceId, { bypassCache = false } = {}) {
 
     const { data, error } = await supabase
         .from("practices")
-        .select("id, name, max_capacity, opening_time, closing_time, phone_number, subscription_status, calls_limit")
+        .select("id, name, max_capacity, opening_time, closing_time, closed_days, phone_number, subscription_status, calls_limit")
         .eq("id", practiceId)
         .maybeSingle();
 
@@ -529,11 +658,24 @@ async function checkPracticeAccess(practiceId) {
 
 /* --------------------- DB FUNCTIONS --------------------- */
 
-async function checkAvailability(date, time, partySize, maxCapacity, practiceId) {
+async function checkAvailability(date, time, partySize, maxCapacity, practiceId, closedDaysRaw) {
     console.log(`\uD83D\uDD0E DB CHECK: ${date} ${time} (${partySize} Pers)`);
     if (isPastDate(date)) {
         console.warn(`\u26A0\uFE0F Past date rejected: ${date}`);
         return { available: false, error: "Past date" };
+    }
+    const closedDayDetails = getClosedDayDetails(date, closedDaysRaw);
+    if (closedDayDetails.isClosed) {
+        console.warn(`\u26A0\uFE0F Closed day rejected: ${date} (${closedDayDetails.requestedDayName})`);
+        return {
+            available: false,
+            error: "Closed day",
+            is_closed_day: true,
+            requested_day: closedDayDetails.requestedDayName,
+            closed_days: closedDayDetails.closedDayNames,
+            other_closed_days: closedDayDetails.otherClosedDayNames,
+            prompt_user_for_new_date: true
+        };
     }
     const requestedStart = parseTimeToMinutes(time);
     if (requestedStart === null) {
@@ -626,11 +768,24 @@ async function notifyReservationCreatedWithRetry(reservationId) {
     return { success: false, retryable: true, error: lastErrorMessage };
 }
 
-async function createReservation(date, time, partySize, name, practiceId, phoneNumber) {
+async function createReservation(date, time, partySize, name, practiceId, phoneNumber, closedDaysRaw) {
     console.log(`\uD83D\uDCDD RESERVIERUNG: ${name}, ${date}, ${time}`);
     if (isPastDate(date)) {
         console.warn(`\u26A0\uFE0F Past date rejected: ${date}`);
         return { success: false, error: "Past date" };
+    }
+    const closedDayDetails = getClosedDayDetails(date, closedDaysRaw);
+    if (closedDayDetails.isClosed) {
+        console.warn(`\u26A0\uFE0F Closed day reservation rejected: ${date} (${closedDayDetails.requestedDayName})`);
+        return {
+            success: false,
+            error: "Closed day",
+            is_closed_day: true,
+            requested_day: closedDayDetails.requestedDayName,
+            closed_days: closedDayDetails.closedDayNames,
+            other_closed_days: closedDayDetails.otherClosedDayNames,
+            prompt_user_for_new_date: true
+        };
     }
     const { data, error } = await supabase
         .from("reservations")
@@ -1055,7 +1210,8 @@ fastify.register(async (fastify) => {
                         args.time,
                         args.party_size,
                         practiceSettings.max_capacity,
-                        practiceSettings.id
+                        practiceSettings.id,
+                        practiceSettings.closed_days
                     );
                 } else if (tool.function.name === "create_reservation") {
                     const resolvedDate = resolveWeekdayDate(args.date, lastUserMessage?.content || "");
@@ -1065,7 +1221,8 @@ fastify.register(async (fastify) => {
                         args.party_size,
                         args.name,
                         practiceSettings.id,
-                        callerPhone
+                        callerPhone,
+                        practiceSettings.closed_days
                     );
                     if (result?.success) {
                         callEndState.shouldHangupAfterAssistantReply = true;
