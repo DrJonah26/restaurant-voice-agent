@@ -323,20 +323,23 @@ function buildHandoffTwiml(phoneNumber) {
     return `<Response><Dial>${safeNumber}</Dial></Response>`;
 }
 
+function buildHangupTwiml() {
+    return "<Response><Hangup/></Response>";
+}
+
 function buildAccessDeniedTwiml(message) {
     const safeMessage = message || ACCESS_DENIED_MESSAGES.default;
     return `<Response><Say language="de-DE">${safeMessage}</Say><Hangup/></Response>`;
 }
 
-async function transferCallToNumber(callSid, phoneNumber) {
+async function updateTwilioCallTwiml(callSid, twiml) {
     if (!twilioAccountSid || !twilioAuthToken) {
         return { ok: false, error: "Missing Twilio credentials" };
     }
-    const targetNumber = normalizePhoneNumber(phoneNumber);
-    if (!callSid || !targetNumber) {
-        return { ok: false, error: "Missing callSid or phone number" };
+    if (!callSid || !twiml) {
+        return { ok: false, error: "Missing callSid or TwiML" };
     }
-    const twiml = buildHandoffTwiml(targetNumber);
+
     const body = new URLSearchParams({ Twiml: twiml });
     const auth = Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString("base64");
     const response = await fetch(
@@ -356,6 +359,19 @@ async function transferCallToNumber(callSid, phoneNumber) {
         return { ok: false, error: details || `HTTP ${response.status}` };
     }
     return { ok: true };
+}
+
+async function transferCallToNumber(callSid, phoneNumber) {
+    const targetNumber = normalizePhoneNumber(phoneNumber);
+    if (!callSid || !targetNumber) {
+        return { ok: false, error: "Missing callSid or phone number" };
+    }
+    const twiml = buildHandoffTwiml(targetNumber);
+    return updateTwilioCallTwiml(callSid, twiml);
+}
+
+async function hangupCall(callSid) {
+    return updateTwilioCallTwiml(callSid, buildHangupTwiml());
 }
 
 function getWeekdayFromText(text) {
@@ -803,11 +819,16 @@ fastify.register(async (fastify) => {
         let lastAvailabilityCheckIndex = 0;
         let callerPhone = null;
         let callSid = null;
+        let hangupTimer = null;
 
         const handoffState = {
             inProgress: false,
             awaitingConfirmation: false,
             consecutiveMisunderstandings: 0
+        };
+        const callEndState = {
+            shouldHangupAfterAssistantReply: false,
+            hangupScheduled: false
         };
 
         const HANDOFF_MESSAGE = "Ich verbinde Sie zurueck mit dem Restaurant.";
@@ -893,6 +914,32 @@ fastify.register(async (fastify) => {
                 return;
             }
             console.log("Handoff transfer accepted by Twilio");
+        }
+
+        function estimateSpeechDurationMs(text) {
+            if (!text) return 2200;
+            const words = String(text).trim().split(/\s+/).filter(Boolean).length;
+            const estimated = words * 360 + 1200;
+            return Math.max(2200, Math.min(10000, estimated));
+        }
+
+        function scheduleReservationCompletionHangup(lastAssistantText) {
+            if (!callActive || callEndState.hangupScheduled) return;
+            callEndState.hangupScheduled = true;
+            const waitMs = estimateSpeechDurationMs(lastAssistantText);
+
+            hangupTimer = setTimeout(async () => {
+                if (!callActive || handoffState.inProgress) return;
+                if (!callSid) {
+                    connection.close();
+                    return;
+                }
+                const result = await hangupCall(callSid);
+                if (!result.ok) {
+                    console.error("Auto-hangup failed:", result.error);
+                    callEndState.hangupScheduled = false;
+                }
+            }, waitMs);
         }
 
         async function ensurePracticeSettings() {
@@ -1020,6 +1067,9 @@ fastify.register(async (fastify) => {
                         practiceSettings.id,
                         callerPhone
                     );
+                    if (result?.success) {
+                        callEndState.shouldHangupAfterAssistantReply = true;
+                    }
                 }
 
                 // Ergebnis in History speichern
@@ -1108,6 +1158,12 @@ fastify.register(async (fastify) => {
                     // Wir rufen OpenAI sofort wieder auf, damit es das Tool-Ergebnis verarbeitet
                     // und dem User die Antwort ("Ja ist frei") gibt.
                     await processAgentTurn();
+                    return;
+                }
+
+                if (callEndState.shouldHangupAfterAssistantReply && msg.content) {
+                    callEndState.shouldHangupAfterAssistantReply = false;
+                    scheduleReservationCompletionHangup(msg.content);
                     return;
                 }
 
@@ -1212,6 +1268,10 @@ fastify.register(async (fastify) => {
             if (data.event === "stop") {
                 console.log("\uD83D\uDCDE Call ended");
                 callActive = false;
+                if (hangupTimer) {
+                    clearTimeout(hangupTimer);
+                    hangupTimer = null;
+                }
                 dg?.finish();
                 if (callStartedAt) {
                     const durationSeconds = Math.max(0, Math.round((Date.now() - callStartedAt) / 1000));
@@ -1222,6 +1282,10 @@ fastify.register(async (fastify) => {
 
         connection.on("close", () => {
             console.log("\uD83D\uDD0C Connection closed");
+            if (hangupTimer) {
+                clearTimeout(hangupTimer);
+                hangupTimer = null;
+            }
             dg?.finish();
             if (callStartedAt) {
                 const durationSeconds = Math.max(0, Math.round((Date.now() - callStartedAt) / 1000));
