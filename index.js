@@ -99,7 +99,7 @@ function getRolloutPercentFromStage(stage) {
     return 0;
 }
 
-const PERF_V2_ENABLED = parseBoolean(process.env.PERF_V2_ENABLED, false);
+const PERF_V2_ENABLED = parseBoolean(process.env.PERF_V2_ENABLED, true);
 const PERF_V2_ROLLOUT_STAGE = Math.min(3, Math.max(0, Number.parseInt(process.env.PERF_V2_ROLLOUT_STAGE || "3", 10) || 0));
 const PERF_V2_ROLLOUT_PERCENT = parsePercent(process.env.PERF_V2_ROLLOUT_PERCENT, getRolloutPercentFromStage(PERF_V2_ROLLOUT_STAGE));
 const DG_ENDPOINTING_MS_LEGACY = 950;
