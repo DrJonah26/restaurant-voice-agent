@@ -50,6 +50,64 @@ const practiceCache = new Map();
 
 const RESERVATION_DURATION_MINUTES = 60;
 const NOTIFICATION_RETRY_DELAYS_MS = [500, 1000, 2000, 4000, 8000];
+const TURN_QUEUE_MAX_SIZE = 3;
+const QUICK_FILLER_TEXT = "Einen Moment, ich pruefe das sofort.";
+
+function parsePositiveInt(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+    return parsed;
+}
+
+function parsePercent(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(0, Math.min(100, parsed));
+}
+
+function parseBoolean(value, fallback = false) {
+    if (value === undefined || value === null || value === "") return fallback;
+    const normalized = String(value).trim().toLowerCase();
+    if (["1", "true", "yes", "on"].includes(normalized)) return true;
+    if (["0", "false", "no", "off"].includes(normalized)) return false;
+    return fallback;
+}
+
+function parseBackoffDelays(rawValue, fallback) {
+    if (!rawValue) return fallback;
+    const parsed = String(rawValue)
+        .split(",")
+        .map((part) => Number.parseInt(part.trim(), 10))
+        .filter((delay) => Number.isFinite(delay) && delay > 0);
+    return parsed.length > 0 ? parsed : fallback;
+}
+
+function hashToPercent(value) {
+    const text = String(value || "");
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i += 1) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return Math.abs(hash >>> 0) % 100;
+}
+
+function getRolloutPercentFromStage(stage) {
+    if (stage >= 3) return 100;
+    if (stage === 2) return 50;
+    if (stage === 1) return 10;
+    return 0;
+}
+
+const PERF_V2_ENABLED = parseBoolean(process.env.PERF_V2_ENABLED, false);
+const PERF_V2_ROLLOUT_STAGE = Math.min(3, Math.max(0, Number.parseInt(process.env.PERF_V2_ROLLOUT_STAGE || "3", 10) || 0));
+const PERF_V2_ROLLOUT_PERCENT = parsePercent(process.env.PERF_V2_ROLLOUT_PERCENT, getRolloutPercentFromStage(PERF_V2_ROLLOUT_STAGE));
+const DG_ENDPOINTING_MS = parsePositiveInt(process.env.DG_ENDPOINTING_MS, 550);
+const DG_UTTERANCE_END_MS = parsePositiveInt(process.env.DG_UTTERANCE_END_MS, 650);
+const MAX_LLM_HISTORY_MESSAGES = parsePositiveInt(process.env.MAX_LLM_HISTORY_MESSAGES, 18);
+const MAX_TOOL_HISTORY_MESSAGES = parsePositiveInt(process.env.MAX_TOOL_HISTORY_MESSAGES, 4);
+const TRANSCRIPT_QUEUE_RETRIES = parsePositiveInt(process.env.TRANSCRIPT_QUEUE_RETRIES, 2);
+const TRANSCRIPT_QUEUE_BACKOFF_MS = parseBackoffDelays(process.env.TRANSCRIPT_QUEUE_BACKOFF_MS, [300, 900]);
 
 const ACCESS_DENIED_MESSAGES = {
     expired: "Dieses Restaurant ist derzeit nicht verf\u00fcgbar. Bitte versuchen Sie es sp\u00e4ter erneut.",
@@ -209,6 +267,36 @@ function formatDate(date) {
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldEnablePerfV2ForPractice(practiceId) {
+    if (!PERF_V2_ENABLED) return false;
+    if (!practiceId) return false;
+    if (PERF_V2_ROLLOUT_PERCENT >= 100) return true;
+    if (PERF_V2_ROLLOUT_PERCENT <= 0) return false;
+    return hashToPercent(practiceId) < PERF_V2_ROLLOUT_PERCENT;
+}
+
+function trimMessagesForLLM(history, maxDialogMessages = MAX_LLM_HISTORY_MESSAGES, maxToolMessages = MAX_TOOL_HISTORY_MESSAGES) {
+    if (!Array.isArray(history) || history.length === 0) return [];
+
+    const indexed = history.map((message, index) => ({ message, index }));
+    const systemMessages = indexed.filter((entry) => entry.message?.role === "system");
+    const toolMessages = indexed.filter((entry) => entry.message?.role === "tool");
+    const dialogMessages = indexed.filter((entry) => entry.message?.role !== "system" && entry.message?.role !== "tool");
+
+    const selectedDialog = dialogMessages.slice(-maxDialogMessages);
+    const selectedTools = toolMessages.slice(-maxToolMessages);
+
+    const selectedIndexes = new Set();
+    for (const entry of selectedDialog) selectedIndexes.add(entry.index);
+    for (const entry of selectedTools) selectedIndexes.add(entry.index);
+
+    const nonSystemSelected = indexed
+        .filter((entry) => selectedIndexes.has(entry.index))
+        .map((entry) => entry.message);
+
+    return [...systemMessages.map((entry) => entry.message), ...nonSystemSelected];
 }
 
 function parseTimeToMinutes(value) {
@@ -879,10 +967,15 @@ async function createReservation(date, time, partySize, name, practiceId, phoneN
         return { success: false, error: "Reservation id missing" };
     }
 
-    const notificationResult = await notifyReservationCreatedWithRetry(reservationId);
-    if (!notificationResult.success && !notificationResult.skipped) {
-        console.warn(`Reservation notification error: ${notificationResult.error || "unknown error"}`);
-    }
+    void notifyReservationCreatedWithRetry(reservationId)
+        .then((notificationResult) => {
+            if (!notificationResult.success && !notificationResult.skipped) {
+                console.warn(`Reservation notification error: ${notificationResult.error || "unknown error"}`);
+            }
+        })
+        .catch((err) => {
+            console.warn("Reservation notification error:", err?.message || String(err));
+        });
 
     return { success: true, id: reservationId };
 }
@@ -1092,6 +1185,157 @@ fastify.register(async (fastify) => {
         let practiceId = req.query?.practice_id;
         let practiceSettings = null;
         let messages = [];
+        let perfV2EnabledForCall = false;
+        let turnSequence = 0;
+        const pendingTurns = [];
+        const transcriptQueue = [];
+        let transcriptQueueRunning = false;
+
+        const openAiTools = [
+            {
+                type: "function",
+                function: {
+                    name: "check_availability",
+                    description: "Pr\u00fcft ob ein Tisch frei ist.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            date: { type: "string", description: "Format YYYY-MM-DD" },
+                            time: { type: "string", description: "Format HH:MM" },
+                            party_size: { type: "number" }
+                        },
+                        required: ["date", "time", "party_size"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "create_reservation",
+                    description: "Legt eine Reservierung an.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            date: { type: "string" },
+                            time: { type: "string" },
+                            party_size: { type: "number" },
+                            name: { type: "string" }
+                        },
+                        required: ["date", "time", "party_size", "name"]
+                    }
+                }
+            }
+        ];
+
+        function warmupTtsCache() {
+            const phrases = [
+                QUICK_FILLER_TEXT,
+                "Alles klar.",
+                "Ich schaue kurz nach.",
+                "Einen Moment bitte."
+            ];
+            for (const phrase of phrases) {
+                if (ttsCache.has(phrase)) continue;
+                void generateTTS(phrase).catch((err) => {
+                    console.warn("TTS warmup failed:", err?.message || String(err));
+                });
+            }
+        }
+
+        function createTurnMetrics(sttFinalAt) {
+            turnSequence += 1;
+            return {
+                turn_id: turnSequence,
+                stream_sid: streamSid || null,
+                call_sid: callSid || null,
+                practice_id: practiceId || null,
+                perf_v2_enabled: perfV2EnabledForCall,
+                stt_final_at: sttFinalAt,
+                llm_spans: [],
+                tool_spans: [],
+                tts_start_at: null,
+                tts_send_at: null,
+                first_response_at: null,
+                openai_calls_per_turn: 0,
+                tool_calls_per_turn: 0,
+                user_text_length: 0
+            };
+        }
+
+        function flushTurnMetrics(metrics, reason) {
+            if (!metrics) return;
+            const turnFirstResponseMs = metrics.first_response_at && metrics.stt_final_at
+                ? Math.max(0, metrics.first_response_at - metrics.stt_final_at)
+                : null;
+            const payload = {
+                event: "turn_metrics",
+                ...metrics,
+                reason: reason || "completed",
+                turn_first_response_ms: turnFirstResponseMs
+            };
+            console.log(JSON.stringify(payload));
+        }
+
+        async function processTranscriptQueue() {
+            if (transcriptQueueRunning) return;
+            transcriptQueueRunning = true;
+            try {
+                while (transcriptQueue.length > 0) {
+                    const item = transcriptQueue.shift();
+                    if (!item || !item.callLogId || !item.role || !item.content) continue;
+
+                    let success = false;
+                    let lastError = null;
+                    for (let attempt = 0; attempt <= TRANSCRIPT_QUEUE_RETRIES; attempt += 1) {
+                        const result = await createTranscriptEntry(item.callLogId, item.role, item.content);
+                        if (result?.success) {
+                            success = true;
+                            break;
+                        }
+                        lastError = result?.error || "unknown_error";
+                        if (attempt >= TRANSCRIPT_QUEUE_RETRIES) break;
+                        const waitMs = TRANSCRIPT_QUEUE_BACKOFF_MS[Math.min(attempt, TRANSCRIPT_QUEUE_BACKOFF_MS.length - 1)] || 300;
+                        await sleep(waitMs);
+                    }
+
+                    if (!success) {
+                        console.warn("Transcript queue item failed:", {
+                            role: item.role,
+                            callLogId: item.callLogId,
+                            error: lastError
+                        });
+                    }
+                }
+            } finally {
+                transcriptQueueRunning = false;
+            }
+        }
+
+        function enqueueTranscriptEntry(callLogIdValue, role, content) {
+            if (!callLogIdValue || !role || !content) return;
+            transcriptQueue.push({
+                callLogId: callLogIdValue,
+                role,
+                content
+            });
+            void processTranscriptQueue();
+        }
+
+        async function recordTranscriptEntry(role, content) {
+            if (!callLogId || !role || !content) return;
+            if (!perfV2EnabledForCall) {
+                await createTranscriptEntry(callLogId, role, content);
+                return;
+            }
+            enqueueTranscriptEntry(callLogId, role, content);
+        }
+
+        function shouldSendQuickFiller(text) {
+            if (!perfV2EnabledForCall || !text) return false;
+            const normalized = normalizeText(text);
+            const hasReservationIntent = /(reservier|reservierung|tisch|verfuegbar|verf\u00fcgbar|frei|uhr|morgen|heute|uebermorgen|\u00fcbermorgen)/i.test(normalized);
+            return hasReservationIntent;
+        }
 
         function shouldOfferHandoff(text) {
             if (!text) return false;
@@ -1112,7 +1356,7 @@ fastify.register(async (fastify) => {
             const prompt = HANDOFF_CONFIRM_MESSAGE;
             messages.push({ role: "assistant", content: prompt });
             await speak(prompt);
-            await createTranscriptEntry(callLogId, "assistant", prompt);
+            await recordTranscriptEntry("assistant", prompt);
         }
 
         async function handleHandoffConfirmation(text) {
@@ -1128,13 +1372,13 @@ fastify.register(async (fastify) => {
                 const declineText = "Alles klar. Wie kann ich Ihnen sonst helfen?";
                 messages.push({ role: "assistant", content: declineText });
                 await speak(declineText);
-                await createTranscriptEntry(callLogId, "assistant", declineText);
+                await recordTranscriptEntry("assistant", declineText);
                 return true;
             }
             const retryText = "Bitte sagen Sie ja oder nein.";
             messages.push({ role: "assistant", content: retryText });
             await speak(retryText);
-            await createTranscriptEntry(callLogId, "assistant", retryText);
+            await recordTranscriptEntry("assistant", retryText);
             return true;
         }
 
@@ -1146,7 +1390,7 @@ fastify.register(async (fastify) => {
             const handoffText = HANDOFF_MESSAGE;
             messages.push({ role: "assistant", content: handoffText });
             await speak(handoffText);
-            await createTranscriptEntry(callLogId, "assistant", handoffText);
+            await recordTranscriptEntry("assistant", handoffText);
 
             const handoffResolution = resolveHandoffTargetNumber(practiceSettings, {
                 botNumber: botPhoneNumber,
@@ -1161,7 +1405,7 @@ fastify.register(async (fastify) => {
                 const fallbackText = "Die Weiterleitung ist derzeit nicht verfuegbar. Bitte versuchen Sie es spaeter erneut.";
                 messages.push({ role: "assistant", content: fallbackText });
                 await speak(fallbackText);
-                await createTranscriptEntry(callLogId, "assistant", fallbackText);
+                await recordTranscriptEntry("assistant", fallbackText);
                 handoffState.inProgress = false;
                 return;
             }
@@ -1174,7 +1418,7 @@ fastify.register(async (fastify) => {
                 const fallbackText = "Es gibt ein technisches Problem. Bitte rufen Sie spaeter an.";
                 messages.push({ role: "assistant", content: fallbackText });
                 await speak(fallbackText);
-                await createTranscriptEntry(callLogId, "assistant", fallbackText);
+                await recordTranscriptEntry("assistant", fallbackText);
                 handoffState.inProgress = false;
                 return;
             }
@@ -1237,8 +1481,8 @@ fastify.register(async (fastify) => {
                 interim_results: true,
                 encoding: "mulaw",
                 sample_rate: 8000,
-                endpointing: 950,
-                utterance_end_ms: 1000,
+                endpointing: DG_ENDPOINTING_MS,
+                utterance_end_ms: DG_UTTERANCE_END_MS,
                 vad_events: true
             });
 
@@ -1250,25 +1494,17 @@ fastify.register(async (fastify) => {
                 if (handoffState.inProgress) return;
 
                 if (text && isFinal && text.trim().length > 0) {
-                    console.log("\uD83C\uDFA4 User:", text);
-                    if (!processing) {
-                        processing = true;
-                        // User Nachricht hinzufuegen
-                        messages.push({ role: "user", content: text });
-                        await createTranscriptEntry(callLogId, "user", text);
-                        if (await handleHandoffConfirmation(text)) {
-                            processing = false;
-                            return;
-                        }
-                        if (isExplicitHandoffRequest(text)) {
-                            await initiateHandoff("explicit_user_request");
-                            processing = false;
-                            return;
-                        }
-                        // Rekursiven Prozess starten
-                        await processAgentTurn();
-                        processing = false;
+                    const cleanText = text.trim();
+                    console.log("\uD83C\uDFA4 User:", cleanText);
+                    if (pendingTurns.length >= TURN_QUEUE_MAX_SIZE) {
+                        pendingTurns.shift();
+                        console.warn("Turn queue overflow. Oldest turn dropped.");
                     }
+                    pendingTurns.push({
+                        text: cleanText,
+                        sttFinalAt: Date.now()
+                    });
+                    void processPendingTurns();
                 }
             });
 
@@ -1310,13 +1546,64 @@ fastify.register(async (fastify) => {
             return signals.hasDate && signals.hasTime && signals.hasPartySize;
         }
 
-        async function handleToolCalls(toolCalls) {
+        async function handleUserTurn(turn) {
+            if (!turn?.text) return;
+
+            const metrics = createTurnMetrics(turn.sttFinalAt);
+            metrics.user_text_length = turn.text.length;
+
+            try {
+                messages.push({ role: "user", content: turn.text });
+                await recordTranscriptEntry("user", turn.text);
+
+                if (await handleHandoffConfirmation(turn.text)) {
+                    flushTurnMetrics(metrics, "handoff_confirmation");
+                    return;
+                }
+                if (isExplicitHandoffRequest(turn.text)) {
+                    await initiateHandoff("explicit_user_request");
+                    flushTurnMetrics(metrics, "explicit_handoff_request");
+                    return;
+                }
+
+                if (shouldSendQuickFiller(turn.text)) {
+                    await speak(QUICK_FILLER_TEXT, { metrics });
+                    await recordTranscriptEntry("assistant", QUICK_FILLER_TEXT);
+                }
+
+                await processAgentTurn(metrics);
+                flushTurnMetrics(metrics, metrics.error ? "error" : "completed");
+            } catch (err) {
+                console.error("Turn handling error:", err);
+                flushTurnMetrics(metrics, "error");
+            }
+        }
+
+        async function processPendingTurns() {
+            if (processing) return;
+            processing = true;
+            try {
+                while (pendingTurns.length > 0 && callActive && !handoffState.inProgress) {
+                    const nextTurn = pendingTurns.shift();
+                    await handleUserTurn(nextTurn);
+                }
+            } finally {
+                processing = false;
+            }
+
+            if (pendingTurns.length > 0 && callActive && !handoffState.inProgress) {
+                void processPendingTurns();
+            }
+        }
+
+        async function handleToolCalls(toolCalls, metrics = null) {
             console.log("\uD83D\uDEE0\uFE0F Tool Call detected:", toolCalls.length);
             const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
 
             for (const tool of toolCalls) {
                 const args = JSON.parse(tool.function.arguments);
                 let result;
+                const toolStartAt = Date.now();
 
                 if (tool.function.name === "check_availability") {
                     const resolvedDate = resolveWeekdayDate(args.date, lastUserMessage?.content || "");
@@ -1354,82 +1641,66 @@ fastify.register(async (fastify) => {
                 if (tool.function.name === "check_availability") {
                     lastAvailabilityCheckIndex = messages.length;
                 }
+
+                if (metrics) {
+                    metrics.tool_calls_per_turn += 1;
+                    metrics.tool_spans.push({
+                        name: tool.function.name,
+                        start_at: toolStartAt,
+                        end_at: Date.now()
+                    });
+                }
             }
 
             return { handedOff: false };
         }
-        async function processAgentTurn() {
+        async function processAgentTurn(metrics = null) {
             try {
                 if (handoffState.inProgress) return;
-                // OpenAI Anfrage
+
+                const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
+                const forceAvailabilityTool = perfV2EnabledForCall
+                    && (shouldForceAvailabilityCall(lastUserMessage?.content || "") || hasAvailabilityInputs(messages, lastAvailabilityCheckIndex));
+                const toolChoice = forceAvailabilityTool
+                    ? { type: "function", function: { name: "check_availability" } }
+                    : "auto";
+
+                const llmStartAt = Date.now();
                 const res = await openai.chat.completions.create({
                     model: "gpt-4o-mini",
-                    messages,
-                    tools: [
-                        {
-                            type: "function",
-                            function: {
-                                name: "check_availability",
-                                description: "Pr\u00fcft ob ein Tisch frei ist.",
-                                parameters: {
-                                    type: "object",
-                                    properties: {
-                                        date: { type: "string", description: "Format YYYY-MM-DD" },
-                                        time: { type: "string", description: "Format HH:MM" },
-                                        party_size: { type: "number" }
-                                    },
-                                    required: ["date", "time", "party_size"]
-                                }
-                            }
-                        },
-                        {
-                            type: "function",
-                            function: {
-                                name: "create_reservation",
-                                description: "Legt eine Reservierung an.",
-                                parameters: {
-                                    type: "object",
-                                    properties: {
-                                        date: { type: "string" },
-                                        time: { type: "string" },
-                                        party_size: { type: "number" },
-                                        name: { type: "string" }
-                                    },
-                                    required: ["date", "time", "party_size", "name"]
-                                }
-                            }
-                        }
-                    ],
-                    tool_choice: "auto" // KI entscheidet selbst
+                    messages: perfV2EnabledForCall ? trimMessagesForLLM(messages) : messages,
+                    tools: openAiTools,
+                    tool_choice: toolChoice
                 });
+                const llmEndAt = Date.now();
+                if (metrics) {
+                    metrics.openai_calls_per_turn += 1;
+                    metrics.llm_spans.push({
+                        start_at: llmStartAt,
+                        end_at: llmEndAt,
+                        tool_choice: typeof toolChoice === "string" ? toolChoice : toolChoice.function?.name || "function"
+                    });
+                }
 
-                const msg = res.choices[0].message;
-                messages.push(msg); // Antwort immer speichern
+                const msg = res.choices?.[0]?.message;
+                if (!msg) return;
+                messages.push(msg);
 
-                // 1. GIBT ES TEXT? -> SPRECHEN
-                // Das passiert oft VOR dem Tool call ("Ich schaue kurz nach...")
                 if (msg.content) {
                     console.log("\uD83E\uDD16 AI:", msg.content);
-                    await speak(msg.content);
-                    await createTranscriptEntry(callLogId, "assistant", msg.content);
+                    await speak(msg.content, { metrics });
+                    await recordTranscriptEntry("assistant", msg.content);
                 }
 
-                if (msg.content) {
-                    if (shouldOfferHandoff(msg.content)) {
-                        await promptHandoffConfirmation();
-                        return;
-                    }
+                if (msg.content && shouldOfferHandoff(msg.content)) {
+                    await promptHandoffConfirmation();
+                    return;
                 }
 
-                // 2. GIBT ES TOOL CALLS? -> AUSF\u00dcHREN & REKURSION
                 if (msg.tool_calls) {
-                    const { handedOff } = await handleToolCalls(msg.tool_calls);
+                    const { handedOff } = await handleToolCalls(msg.tool_calls, metrics);
                     if (handedOff) return;
-
-                    // WICHTIG: Rekursiver Aufruf!
-                    // Wir rufen OpenAI sofort wieder auf, damit es das Tool-Ergebnis verarbeitet
-                    // und dem User die Antwort ("Ja ist frei") gibt.
-                    await processAgentTurn();
+                    await processAgentTurn(metrics);
                     return;
                 }
 
@@ -1439,53 +1710,52 @@ fastify.register(async (fastify) => {
                     return;
                 }
 
-                if (!msg.tool_calls && (shouldForceAvailabilityCall(msg.content) || hasAvailabilityInputs(messages, lastAvailabilityCheckIndex))) {
+                if (!perfV2EnabledForCall && !msg.tool_calls && (shouldForceAvailabilityCall(msg.content) || hasAvailabilityInputs(messages, lastAvailabilityCheckIndex))) {
+                    const forcedStartAt = Date.now();
                     const forcedRes = await openai.chat.completions.create({
                         model: "gpt-4o-mini",
                         messages,
-                        tools: [
-                            {
-                                type: "function",
-                                function: {
-                                    name: "check_availability",
-                                    description: "Pr\u00fcft ob ein Tisch frei ist.",
-                                    parameters: {
-                                        type: "object",
-                                        properties: {
-                                            date: { type: "string", description: "Format YYYY-MM-DD" },
-                                            time: { type: "string", description: "Format HH:MM" },
-                                            party_size: { type: "number" }
-                                        },
-                                        required: ["date", "time", "party_size"]
-                                    }
-                                }
-                            }
-                        ],
+                        tools: [openAiTools[0]],
                         tool_choice: { type: "function", function: { name: "check_availability" } }
                     });
+                    const forcedEndAt = Date.now();
+                    if (metrics) {
+                        metrics.openai_calls_per_turn += 1;
+                        metrics.llm_spans.push({
+                            start_at: forcedStartAt,
+                            end_at: forcedEndAt,
+                            tool_choice: "check_availability"
+                        });
+                    }
 
-                    const forcedMsg = forcedRes.choices[0].message;
+                    const forcedMsg = forcedRes.choices?.[0]?.message;
+                    if (!forcedMsg) return;
                     messages.push(forcedMsg);
 
                     if (forcedMsg.tool_calls) {
-                        const { handedOff } = await handleToolCalls(forcedMsg.tool_calls);
+                        const { handedOff } = await handleToolCalls(forcedMsg.tool_calls, metrics);
                         if (handedOff) return;
-                        await processAgentTurn();
+                        await processAgentTurn(metrics);
                     }
-                    return;
                 }
-
             } catch (err) {
                 console.error("\u274c LLM Error:", err);
-                await speak("Es gab leider einen Fehler. Bitte nochmal.");
+                if (metrics) {
+                    metrics.error = err?.message || String(err);
+                }
+                await speak("Es gab leider einen Fehler. Bitte nochmal.", { metrics });
             }
         }
 
         /* --------------------- SEND AUDIO --------------------- */
 
-        async function speak(text) {
+        async function speak(text, { metrics = null } = {}) {
             if (!callActive || !streamSid) return;
             try {
+                const ttsStartAt = Date.now();
+                if (metrics && !metrics.tts_start_at) {
+                    metrics.tts_start_at = ttsStartAt;
+                }
                 const audio = await generateTTS(text);
                 const payload = audio.toString("base64");
 
@@ -1494,6 +1764,13 @@ fastify.register(async (fastify) => {
                     streamSid,
                     media: { payload }
                 }));
+                if (metrics) {
+                    const sentAt = Date.now();
+                    metrics.tts_send_at = sentAt;
+                    if (!metrics.first_response_at) {
+                        metrics.first_response_at = sentAt;
+                    }
+                }
             } catch (e) {
                 console.error("TTS Error:", e);
             }
@@ -1510,6 +1787,8 @@ fastify.register(async (fastify) => {
                 callSid = data.start?.callSid || data.start?.call_sid || null;
                 console.log("\uD83D\uDE80 Stream start:", streamSid);
                 practiceId = data.start?.customParameters?.practice_id || practiceId;
+                perfV2EnabledForCall = shouldEnablePerfV2ForPractice(practiceId);
+                console.log(`PERF_V2 status for practice ${practiceId}: ${perfV2EnabledForCall ? "enabled" : "disabled"} (${PERF_V2_ROLLOUT_PERCENT}%)`);
                 const rawCallerPhone = data.start?.customParameters?.caller_phone
                     || data.start?.customParameters?.from
                     || data.start?.customParameters?.From;
@@ -1535,13 +1814,16 @@ fastify.register(async (fastify) => {
                     return;
                 }
                 startDeepgram();
+                if (perfV2EnabledForCall) {
+                    warmupTtsCache();
+                }
                 const greeting = `${practiceSettings.name}, guten Tag. Wie kann ich helfen?`;
                 messages.push({ role: "assistant", content: greeting });
                 setTimeout(() => speak(greeting), 500);
                 callStartedAt = Date.now();
                 const callLog = await createCallLog(practiceId, streamSid);
                 callLogId = callLog.id || null;
-                await createTranscriptEntry(callLogId, "assistant", greeting);
+                await recordTranscriptEntry("assistant", greeting);
             }
 
             if (data.event === "media" && dg && dg.getReadyState() === 1) {
@@ -1552,6 +1834,7 @@ fastify.register(async (fastify) => {
             if (data.event === "stop") {
                 console.log("\uD83D\uDCDE Call ended");
                 callActive = false;
+                pendingTurns.length = 0;
                 if (hangupTimer) {
                     clearTimeout(hangupTimer);
                     hangupTimer = null;
@@ -1566,6 +1849,8 @@ fastify.register(async (fastify) => {
 
         connection.on("close", () => {
             console.log("\uD83D\uDD0C Connection closed");
+            callActive = false;
+            pendingTurns.length = 0;
             if (hangupTimer) {
                 clearTimeout(hangupTimer);
                 hangupTimer = null;
