@@ -60,6 +60,18 @@ const ACCESS_DENIED_MESSAGES = {
 const HANDOFF_THRESHOLDS = {
     misunderstandings: 3
 };
+const HANDOFF_ROUTING_MODE = String(process.env.HANDOFF_ROUTING_MODE || "separate_number").trim().toLowerCase();
+const ALLOW_SAME_NUMBER_HANDOFF = HANDOFF_ROUTING_MODE === "studio_same_number";
+const HANDOFF_NUMBER_KEYS = [
+    "extra_number",
+    "handoff_phone_number",
+    "transfer_phone_number",
+    "forward_phone_number",
+    "fallback_phone_number",
+    "human_phone_number",
+    "phone_number"
+];
+console.log(`Handoff routing mode: ${HANDOFF_ROUTING_MODE}`);
 
 const WEEKDAY_MAP = {
     sonntag: 0,
@@ -437,10 +449,73 @@ function normalizePhoneNumber(value) {
     return normalized;
 }
 
-function buildHandoffTwiml(phoneNumber) {
+function toComparablePhoneNumber(value) {
+    const normalized = normalizePhoneNumber(value);
+    if (!normalized) return null;
+    return normalized.replace(/\D/g, "");
+}
+
+function isSamePhoneNumber(a, b) {
+    const aComparable = toComparablePhoneNumber(a);
+    const bComparable = toComparablePhoneNumber(b);
+    if (!aComparable || !bComparable) return false;
+    return aComparable === bComparable;
+}
+
+function getHandoffNumberCandidates(settings) {
+    const candidates = [];
+    for (const key of HANDOFF_NUMBER_KEYS) {
+        const normalized = normalizePhoneNumber(settings?.[key]);
+        if (!normalized) continue;
+        if (!candidates.some((existing) => isSamePhoneNumber(existing, normalized))) {
+            candidates.push(normalized);
+        }
+    }
+    return candidates;
+}
+
+function resolveHandoffTargetNumber(settings, { botNumber = null, forwardedFrom = null, allowSameNumber = false } = {}) {
+    const candidates = getHandoffNumberCandidates(settings);
+    if (!candidates.length) {
+        return { targetNumber: null, reason: "missing_target_number" };
+    }
+    const normalizedBotNumber = normalizePhoneNumber(botNumber);
+    if (allowSameNumber && !normalizedBotNumber) {
+        return { targetNumber: null, reason: "missing_bot_number_for_same_number_mode" };
+    }
+
+    for (const candidate of candidates) {
+        const matchesBotNumber = isSamePhoneNumber(candidate, normalizedBotNumber);
+        const matchesForwardedFrom = isSamePhoneNumber(candidate, forwardedFrom);
+
+        if (!allowSameNumber && (matchesBotNumber || matchesForwardedFrom)) {
+            continue;
+        }
+
+        return {
+            targetNumber: candidate,
+            reason: null,
+            callerIdForTransfer: allowSameNumber ? normalizedBotNumber : null
+        };
+    }
+
+    if (normalizedBotNumber && candidates.some((candidate) => isSamePhoneNumber(candidate, normalizedBotNumber))) {
+        return { targetNumber: null, reason: "target_matches_bot_number" };
+    }
+    if (forwardedFrom && candidates.some((candidate) => isSamePhoneNumber(candidate, forwardedFrom))) {
+        return { targetNumber: null, reason: "target_matches_forwarded_from" };
+    }
+    return { targetNumber: null, reason: "no_usable_target_number" };
+}
+
+function buildHandoffTwiml(phoneNumber, { callerId = null } = {}) {
     const safeNumber = normalizePhoneNumber(phoneNumber);
     if (!safeNumber) return "";
-    return `<Response><Dial>${safeNumber}</Dial></Response>`;
+    const safeCallerId = normalizePhoneNumber(callerId);
+    if (safeCallerId) {
+        return `<Response><Dial callerId="${safeCallerId}"><Number>${safeNumber}</Number></Dial></Response>`;
+    }
+    return `<Response><Dial><Number>${safeNumber}</Number></Dial></Response>`;
 }
 
 function buildHangupTwiml() {
@@ -481,12 +556,12 @@ async function updateTwilioCallTwiml(callSid, twiml) {
     return { ok: true };
 }
 
-async function transferCallToNumber(callSid, phoneNumber) {
+async function transferCallToNumber(callSid, phoneNumber, { callerId = null } = {}) {
     const targetNumber = normalizePhoneNumber(phoneNumber);
     if (!callSid || !targetNumber) {
         return { ok: false, error: "Missing callSid or phone number" };
     }
-    const twiml = buildHandoffTwiml(targetNumber);
+    const twiml = buildHandoffTwiml(targetNumber, { callerId });
     return updateTwilioCallTwiml(callSid, twiml);
 }
 
@@ -586,7 +661,7 @@ async function getPracticeSettings(practiceId, { bypassCache = false } = {}) {
 
     const { data, error } = await supabase
         .from("practices")
-        .select("id, name, max_capacity, opening_time, closing_time, closed_days, phone_number, subscription_status, calls_limit")
+        .select("*")
         .eq("id", practiceId)
         .maybeSingle();
 
@@ -922,6 +997,24 @@ fastify.all("/incoming-call", async (req, reply) => {
         ?? req.query?.from
         ?? null;
     const callerPhone = decodeCustomParam(rawCallerPhone);
+    const rawBotNumber = req.query?.bot_number
+        ?? req.query?.to_number
+        ?? req.body?.To
+        ?? req.body?.to
+        ?? req.query?.To
+        ?? req.query?.to
+        ?? req.body?.Called
+        ?? req.query?.Called
+        ?? req.body?.called
+        ?? req.query?.called
+        ?? null;
+    const botNumber = decodeCustomParam(rawBotNumber);
+    const rawForwardedFrom = req.query?.forwarded_from
+        ?? req.body?.forwarded_from
+        ?? req.body?.ForwardedFrom
+        ?? req.query?.ForwardedFrom
+        ?? null;
+    const forwardedFrom = decodeCustomParam(rawForwardedFrom);
 
     if (!practiceId) {
         reply.type("text/xml").send(`
@@ -935,16 +1028,25 @@ fastify.all("/incoming-call", async (req, reply) => {
 
     const access = await checkPracticeAccess(practiceId);
     if (!access.allowed) {
-        const forwardNumber = normalizePhoneNumber(access.settings?.phone_number);
+        const handoffResolution = resolveHandoffTargetNumber(access.settings, {
+            botNumber,
+            forwardedFrom
+        });
+        const forwardNumber = handoffResolution.targetNumber;
         if (forwardNumber) {
             reply.type("text/xml").send(buildHandoffTwiml(forwardNumber));
         } else {
+            if (handoffResolution.reason) {
+                console.warn(`Access denied forward blocked: ${handoffResolution.reason}`);
+            }
             reply.type("text/xml").send(buildAccessDeniedTwiml(access.message));
         }
         return;
     }
 
     const callerPhoneParam = callerPhone ? encodeURIComponent(String(callerPhone).trim()) : "";
+    const botNumberParam = botNumber ? encodeURIComponent(String(botNumber).trim()) : "";
+    const forwardedFromParam = forwardedFrom ? encodeURIComponent(String(forwardedFrom).trim()) : "";
 
     reply.type("text/xml").send(`
 <Response>
@@ -952,6 +1054,8 @@ fastify.all("/incoming-call", async (req, reply) => {
     <Stream url="wss://${req.headers.host}/media-stream">
       <Parameter name="practice_id" value="${encodeURIComponent(practiceId)}" />
       <Parameter name="caller_phone" value="${callerPhoneParam}" />
+      <Parameter name="bot_number" value="${botNumberParam}" />
+      <Parameter name="forwarded_from" value="${forwardedFromParam}" />
     </Stream>
   </Connect>
 </Response>
@@ -973,6 +1077,8 @@ fastify.register(async (fastify) => {
         let callStartedAt = null;
         let lastAvailabilityCheckIndex = 0;
         let callerPhone = null;
+        let botPhoneNumber = decodeCustomParam(req.query?.bot_number) || null;
+        let forwardedFromNumber = decodeCustomParam(req.query?.forwarded_from) || null;
         let callSid = null;
         let hangupTimer = null;
 
@@ -986,8 +1092,8 @@ fastify.register(async (fastify) => {
             hangupScheduled: false
         };
 
-        const HANDOFF_MESSAGE = "Ich verbinde Sie zurueck mit dem Restaurant.";
-        const HANDOFF_CONFIRM_MESSAGE = "M\u00f6chten Sie zu einem Mitarbeiter weitergeleitet werden?";
+        const HANDOFF_MESSAGE = "Ich verbinde Sie zurück mit dem Restaurant.";
+        const HANDOFF_CONFIRM_MESSAGE = "Möchten Sie zu einem Mitarbeiter weitergeleitet werden?";
 
         let practiceId = req.query?.practice_id;
         let practiceSettings = null;
@@ -1048,9 +1154,17 @@ fastify.register(async (fastify) => {
             await speak(handoffText);
             await createTranscriptEntry(callLogId, "assistant", handoffText);
 
-            const targetNumber = normalizePhoneNumber(practiceSettings?.phone_number);
+            const handoffResolution = resolveHandoffTargetNumber(practiceSettings, {
+                botNumber: botPhoneNumber,
+                forwardedFrom: forwardedFromNumber,
+                allowSameNumber: ALLOW_SAME_NUMBER_HANDOFF
+            });
+            const targetNumber = handoffResolution.targetNumber;
             if (!targetNumber) {
-                const fallbackText = "Es gibt ein technisches Problem. Bitte rufen Sie spaeter an.";
+                if (handoffResolution.reason) {
+                    console.warn(`Handoff blocked: ${handoffResolution.reason}`);
+                }
+                const fallbackText = "Die Weiterleitung ist derzeit nicht verfuegbar. Bitte versuchen Sie es spaeter erneut.";
                 messages.push({ role: "assistant", content: fallbackText });
                 await speak(fallbackText);
                 await createTranscriptEntry(callLogId, "assistant", fallbackText);
@@ -1058,7 +1172,9 @@ fastify.register(async (fastify) => {
                 return;
             }
 
-            const transfer = await transferCallToNumber(callSid, targetNumber);
+            const transfer = await transferCallToNumber(callSid, targetNumber, {
+                callerId: handoffResolution.callerIdForTransfer || null
+            });
             if (!transfer.ok) {
                 console.error("Handoff failed:", transfer.error);
                 const fallbackText = "Es gibt ein technisches Problem. Bitte rufen Sie spaeter an.";
@@ -1102,10 +1218,15 @@ fastify.register(async (fastify) => {
             const access = await checkPracticeAccess(practiceId);
             if (!access.allowed || !access.settings) {
                 console.error("Practice Access Denied:", access.reason || "Not allowed");
+                const handoffResolution = resolveHandoffTargetNumber(access.settings, {
+                    botNumber: botPhoneNumber,
+                    forwardedFrom: forwardedFromNumber
+                });
                 return {
                     ok: false,
                     message: access.message || ACCESS_DENIED_MESSAGES.default,
-                    forwardToNumber: normalizePhoneNumber(access.settings?.phone_number)
+                    forwardToNumber: handoffResolution.targetNumber,
+                    forwardBlockedReason: handoffResolution.reason
                 };
             }
             practiceSettings = access.settings;
@@ -1399,8 +1520,20 @@ fastify.register(async (fastify) => {
                     || data.start?.customParameters?.from
                     || data.start?.customParameters?.From;
                 callerPhone = decodeCustomParam(rawCallerPhone) || null;
+                const rawBotNumber = data.start?.customParameters?.bot_number
+                    || data.start?.customParameters?.to
+                    || data.start?.customParameters?.To
+                    || data.start?.customParameters?.called
+                    || data.start?.customParameters?.Called;
+                botPhoneNumber = decodeCustomParam(rawBotNumber) || botPhoneNumber;
+                const rawForwardedFrom = data.start?.customParameters?.forwarded_from
+                    || data.start?.customParameters?.ForwardedFrom;
+                forwardedFromNumber = decodeCustomParam(rawForwardedFrom) || forwardedFromNumber;
                 const init = await ensurePracticeSettings();
                 if (!init.ok) {
+                    if (init.forwardBlockedReason) {
+                        console.warn(`Initial forward blocked: ${init.forwardBlockedReason}`);
+                    }
                     if (init.forwardToNumber && callSid) {
                         await transferCallToNumber(callSid, init.forwardToNumber);
                     }

@@ -13,9 +13,19 @@ export async function POST(request: Request) {
       tableCount,
       seatCount,
       phoneNumber,
+      handoffPhoneNumber,
       language,
       openingHours,
     } = data
+
+    const normalizedHandoffPhoneNumber =
+      typeof handoffPhoneNumber === "string" ? handoffPhoneNumber.trim() : ""
+    if (!normalizedHandoffPhoneNumber) {
+      return NextResponse.json(
+        { error: "Die weitere Telefonnummer ist ein Pflichtfeld" },
+        { status: 400 }
+      )
+    }
 
     // Prüfe ob bereits ein Restaurant existiert
     const existingRestaurant = await prisma.restaurant.findUnique({
@@ -32,6 +42,7 @@ export async function POST(request: Request) {
           tableCount,
           seatCount,
           phoneNumber: phoneNumber || null,
+          handoffPhoneNumber: normalizedHandoffPhoneNumber,
           language,
         },
       })
@@ -60,6 +71,7 @@ export async function POST(request: Request) {
           tableCount,
           seatCount,
           phoneNumber: phoneNumber || null,
+          handoffPhoneNumber: normalizedHandoffPhoneNumber,
           language,
           openingHours: {
             create: openingHours.map((oh: any) => ({

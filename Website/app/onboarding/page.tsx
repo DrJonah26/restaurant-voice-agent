@@ -9,6 +9,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Navbar } from "@/components/navbar"
+import { Info } from "lucide-react"
 
 const DAYS = [
   { value: 0, label: "Sonntag" },
@@ -32,6 +33,7 @@ export default function OnboardingPage() {
     tableCount: "",
     seatCount: "",
     phoneNumber: "",
+    handoffPhoneNumber: "",
     language: "de",
   })
 
@@ -178,7 +180,7 @@ export default function OnboardingPage() {
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="phoneNumber">Telefonnummer für Weiterleitungen</Label>
+                <Label htmlFor="phoneNumber">Geschäftsnummer</Label>
                 <Input
                   id="phoneNumber"
                   type="tel"
@@ -187,6 +189,28 @@ export default function OnboardingPage() {
                   onChange={(e) =>
                     setFormData({ ...formData, phoneNumber: e.target.value })
                   }
+                />
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <Label htmlFor="handoffPhoneNumber">Weitere Telefonnummer *</Label>
+                  <span className="group relative inline-flex">
+                    <Info className="h-4 w-4 cursor-help text-muted-foreground" aria-hidden="true" />
+                    <span className="pointer-events-none absolute left-1/2 top-full z-10 mt-2 w-72 -translate-x-1/2 rounded-md bg-popover p-2 text-xs text-popover-foreground opacity-0 shadow-md ring-1 ring-border transition-opacity group-hover:opacity-100">
+                      Damit wir Ihre Kunden bei Bedarf persönlich verbinden können, benötigen wir eine zweite Rufnummer für die KI-Weiterleitung.
+                    </span>
+                  </span>
+                </div>
+                <Input
+                  id="handoffPhoneNumber"
+                  type="tel"
+                  placeholder="+49 123 456789"
+                  value={formData.handoffPhoneNumber}
+                  onChange={(e) =>
+                    setFormData({ ...formData, handoffPhoneNumber: e.target.value })
+                  }
+                  required
                 />
               </div>
 

@@ -38,6 +38,7 @@ async function main() {
       tableCount: 15,
       seatCount: 45,
       phoneNumber: "+49 123 456789",
+      handoffPhoneNumber: "+49 123 456780",
       language: "de",
       openingHours: {
         create: [

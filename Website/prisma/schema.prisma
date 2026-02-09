@@ -31,6 +31,7 @@ model Restaurant {
   tableCount      Int
   seatCount       Int
   phoneNumber     String?
+  handoffPhoneNumber String?
   language        String       @default("de")
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt
