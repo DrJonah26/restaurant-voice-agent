@@ -102,8 +102,10 @@ function getRolloutPercentFromStage(stage) {
 const PERF_V2_ENABLED = parseBoolean(process.env.PERF_V2_ENABLED, false);
 const PERF_V2_ROLLOUT_STAGE = Math.min(3, Math.max(0, Number.parseInt(process.env.PERF_V2_ROLLOUT_STAGE || "3", 10) || 0));
 const PERF_V2_ROLLOUT_PERCENT = parsePercent(process.env.PERF_V2_ROLLOUT_PERCENT, getRolloutPercentFromStage(PERF_V2_ROLLOUT_STAGE));
-const DG_ENDPOINTING_MS = parsePositiveInt(process.env.DG_ENDPOINTING_MS, 550);
-const DG_UTTERANCE_END_MS = parsePositiveInt(process.env.DG_UTTERANCE_END_MS, 650);
+const DG_ENDPOINTING_MS_LEGACY = 950;
+const DG_UTTERANCE_END_MS_LEGACY = 1000;
+const DG_ENDPOINTING_MS = Math.max(200, parsePositiveInt(process.env.DG_ENDPOINTING_MS, 550));
+const DG_UTTERANCE_END_MS = Math.max(1000, parsePositiveInt(process.env.DG_UTTERANCE_END_MS, 1000));
 const MAX_LLM_HISTORY_MESSAGES = parsePositiveInt(process.env.MAX_LLM_HISTORY_MESSAGES, 18);
 const MAX_TOOL_HISTORY_MESSAGES = parsePositiveInt(process.env.MAX_TOOL_HISTORY_MESSAGES, 4);
 const TRANSCRIPT_QUEUE_RETRIES = parsePositiveInt(process.env.TRANSCRIPT_QUEUE_RETRIES, 2);
@@ -1159,6 +1161,9 @@ fastify.register(async (fastify) => {
         let streamSid = null;
         let callActive = false;
         let dg = null;
+        let deepgramConnected = false;
+        let deepgramFallbackAttempted = false;
+        let deepgramFailureHandled = false;
         let processing = false;
         let callLogId = null;
         let callStartedAt = null;
@@ -1473,20 +1478,37 @@ fastify.register(async (fastify) => {
         }
 
         /* --------------------- DEEPGRAM --------------------- */
-        function startDeepgram() {
-            dg = deepgram.listen.live({
+        function getDeepgramLiveOptions(useFallback = false) {
+            const endpointing = useFallback
+                ? DG_ENDPOINTING_MS_LEGACY
+                : (perfV2EnabledForCall ? DG_ENDPOINTING_MS : DG_ENDPOINTING_MS_LEGACY);
+            const utteranceEndMs = useFallback
+                ? DG_UTTERANCE_END_MS_LEGACY
+                : (perfV2EnabledForCall ? DG_UTTERANCE_END_MS : DG_UTTERANCE_END_MS_LEGACY);
+
+            return {
                 model: "nova-3",
                 language: "de",
                 smart_format: true,
                 interim_results: true,
                 encoding: "mulaw",
                 sample_rate: 8000,
-                endpointing: DG_ENDPOINTING_MS,
-                utterance_end_ms: DG_UTTERANCE_END_MS,
+                endpointing,
+                utterance_end_ms: utteranceEndMs,
                 vad_events: true
-            });
+            };
+        }
 
-            dg.on(LiveTranscriptionEvents.Open, () => console.log("\u2705 Deepgram listening"));
+        function startDeepgram({ useFallback = false } = {}) {
+            const liveOptions = getDeepgramLiveOptions(useFallback);
+            deepgramConnected = false;
+
+            dg = deepgram.listen.live(liveOptions);
+
+            dg.on(LiveTranscriptionEvents.Open, () => {
+                deepgramConnected = true;
+                console.log(`\u2705 Deepgram listening (endpointing=${liveOptions.endpointing}, utterance_end_ms=${liveOptions.utterance_end_ms})`);
+            });
 
             dg.on(LiveTranscriptionEvents.Transcript, async (data) => {
                 const text = data?.channel?.alternatives?.[0]?.transcript;
@@ -1509,7 +1531,35 @@ fastify.register(async (fastify) => {
             });
 
             dg.on(LiveTranscriptionEvents.Close, () => console.log("\uD83D\uDD0C Deepgram closed"));
-            dg.on(LiveTranscriptionEvents.Error, (e) => console.error("DG Error:", e));
+            dg.on(LiveTranscriptionEvents.Error, async (e) => {
+                const message = e?.message || "unknown_deepgram_error";
+                const isHandshakeError = /non-101 status code|ready state: connecting|network error/i.test(message);
+                console.error("DG Error:", {
+                    message,
+                    requestId: e?.requestId,
+                    statusCode: e?.statusCode,
+                    url: e?.url,
+                    readyState: e?.readyState
+                });
+
+                if (!deepgramConnected && isHandshakeError && !useFallback && !deepgramFallbackAttempted) {
+                    deepgramFallbackAttempted = true;
+                    console.warn("Deepgram handshake failed. Retrying once with legacy streaming parameters.");
+                    try {
+                        dg?.finish();
+                    } catch {
+                        // no-op
+                    }
+                    startDeepgram({ useFallback: true });
+                    return;
+                }
+
+                if (!deepgramConnected && !deepgramFailureHandled && callActive) {
+                    deepgramFailureHandled = true;
+                    console.error("Deepgram connection failed permanently. Triggering handoff.");
+                    await initiateHandoff("deepgram_connection_error");
+                }
+            });
         }
 
         /* --------------------- REKURSIVE LLM LOGIK --------------------- */
@@ -1784,11 +1834,14 @@ fastify.register(async (fastify) => {
             if (data.event === "start") {
                 streamSid = data.start.streamSid;
                 callActive = true;
+                deepgramConnected = false;
+                deepgramFallbackAttempted = false;
+                deepgramFailureHandled = false;
                 callSid = data.start?.callSid || data.start?.call_sid || null;
                 console.log("\uD83D\uDE80 Stream start:", streamSid);
                 practiceId = data.start?.customParameters?.practice_id || practiceId;
                 perfV2EnabledForCall = shouldEnablePerfV2ForPractice(practiceId);
-                console.log(`PERF_V2 status for practice ${practiceId}: ${perfV2EnabledForCall ? "enabled" : "disabled"} (${PERF_V2_ROLLOUT_PERCENT}%)`);
+                console.log(`PERF_V2 status for practice ${practiceId}: ${perfV2EnabledForCall ? "enabled" : "disabled"} (global=${PERF_V2_ENABLED}, rollout=${PERF_V2_ROLLOUT_PERCENT}%)`);
                 const rawCallerPhone = data.start?.customParameters?.caller_phone
                     || data.start?.customParameters?.from
                     || data.start?.customParameters?.From;
