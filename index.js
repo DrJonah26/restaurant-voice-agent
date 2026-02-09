@@ -63,12 +63,7 @@ const HANDOFF_THRESHOLDS = {
 const HANDOFF_ROUTING_MODE = String(process.env.HANDOFF_ROUTING_MODE || "separate_number").trim().toLowerCase();
 const ALLOW_SAME_NUMBER_HANDOFF = HANDOFF_ROUTING_MODE === "studio_same_number";
 const HANDOFF_NUMBER_KEYS = [
-    "handoff_phone_number",
-    "transfer_phone_number",
-    "forward_phone_number",
-    "fallback_phone_number",
-    "human_phone_number",
-    "phone_number"
+    "extra_number"
 ];
 console.log(`Handoff routing mode: ${HANDOFF_ROUTING_MODE}`);
 
