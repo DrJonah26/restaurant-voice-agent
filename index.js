@@ -106,6 +106,7 @@ const DG_ENDPOINTING_MS_LEGACY = 950;
 const DG_UTTERANCE_END_MS_LEGACY = 1000;
 const DG_ENDPOINTING_MS = Math.max(200, parsePositiveInt(process.env.DG_ENDPOINTING_MS, 550));
 const DG_UTTERANCE_END_MS = Math.max(1000, parsePositiveInt(process.env.DG_UTTERANCE_END_MS, 1000));
+const INITIAL_TURN_COALESCE_MS = parsePositiveInt(process.env.INITIAL_TURN_COALESCE_MS, 900);
 const MAX_LLM_HISTORY_MESSAGES = parsePositiveInt(process.env.MAX_LLM_HISTORY_MESSAGES, 18);
 const MAX_TOOL_HISTORY_MESSAGES = parsePositiveInt(process.env.MAX_TOOL_HISTORY_MESSAGES, 4);
 const TRANSCRIPT_QUEUE_RETRIES = parsePositiveInt(process.env.TRANSCRIPT_QUEUE_RETRIES, 2);
@@ -1173,6 +1174,9 @@ fastify.register(async (fastify) => {
         let forwardedFromNumber = decodeCustomParam(req.query?.forwarded_from) || null;
         let callSid = null;
         let hangupTimer = null;
+        let greetingTimer = null;
+        let hasProcessedFirstUserTurn = false;
+        let firstTurnBuffer = null;
 
         const handoffState = {
             inProgress: false,
@@ -1340,6 +1344,65 @@ fastify.register(async (fastify) => {
             const normalized = normalizeText(text);
             const hasReservationIntent = /(reservier|reservierung|tisch|verfuegbar|verf\u00fcgbar|frei|uhr|morgen|heute|uebermorgen|\u00fcbermorgen)/i.test(normalized);
             return hasReservationIntent;
+        }
+
+        function enqueueTurn(text, sttFinalAt = Date.now()) {
+            if (!text) return;
+            if (pendingTurns.length >= TURN_QUEUE_MAX_SIZE) {
+                pendingTurns.shift();
+                console.warn("Turn queue overflow. Oldest turn dropped.");
+            }
+            pendingTurns.push({
+                text,
+                sttFinalAt
+            });
+            void processPendingTurns();
+        }
+
+        function clearFirstTurnBuffer() {
+            if (!firstTurnBuffer) return;
+            if (firstTurnBuffer.timer) {
+                clearTimeout(firstTurnBuffer.timer);
+            }
+            firstTurnBuffer = null;
+        }
+
+        function flushFirstTurnBuffer() {
+            if (!firstTurnBuffer) return;
+            const mergedText = firstTurnBuffer.parts.join(" ").replace(/\s+/g, " ").trim();
+            const sttFinalAt = firstTurnBuffer.sttFinalAt || Date.now();
+            clearFirstTurnBuffer();
+            hasProcessedFirstUserTurn = true;
+            if (mergedText) {
+                enqueueTurn(mergedText, sttFinalAt);
+            }
+        }
+
+        function handleIncomingFinalTranscript(cleanText) {
+            if (!cleanText) return;
+
+            if (!hasProcessedFirstUserTurn) {
+                if (!firstTurnBuffer) {
+                    firstTurnBuffer = {
+                        parts: [cleanText],
+                        sttFinalAt: Date.now(),
+                        timer: null
+                    };
+                } else {
+                    firstTurnBuffer.parts.push(cleanText);
+                    firstTurnBuffer.sttFinalAt = Date.now();
+                    if (firstTurnBuffer.timer) {
+                        clearTimeout(firstTurnBuffer.timer);
+                    }
+                }
+
+                firstTurnBuffer.timer = setTimeout(() => {
+                    flushFirstTurnBuffer();
+                }, INITIAL_TURN_COALESCE_MS);
+                return;
+            }
+
+            enqueueTurn(cleanText, Date.now());
         }
 
         function shouldOfferHandoff(text) {
@@ -1514,19 +1577,16 @@ fastify.register(async (fastify) => {
                 const text = data?.channel?.alternatives?.[0]?.transcript;
                 const isFinal = data?.is_final;
                 if (handoffState.inProgress) return;
+                if (text && text.trim().length > 0 && greetingTimer) {
+                    clearTimeout(greetingTimer);
+                    greetingTimer = null;
+                    console.log("Greeting canceled due to early user speech.");
+                }
 
                 if (text && isFinal && text.trim().length > 0) {
                     const cleanText = text.trim();
                     console.log("\uD83C\uDFA4 User:", cleanText);
-                    if (pendingTurns.length >= TURN_QUEUE_MAX_SIZE) {
-                        pendingTurns.shift();
-                        console.warn("Turn queue overflow. Oldest turn dropped.");
-                    }
-                    pendingTurns.push({
-                        text: cleanText,
-                        sttFinalAt: Date.now()
-                    });
-                    void processPendingTurns();
+                    handleIncomingFinalTranscript(cleanText);
                 }
             });
 
@@ -1837,6 +1897,12 @@ fastify.register(async (fastify) => {
                 deepgramConnected = false;
                 deepgramFallbackAttempted = false;
                 deepgramFailureHandled = false;
+                hasProcessedFirstUserTurn = false;
+                clearFirstTurnBuffer();
+                if (greetingTimer) {
+                    clearTimeout(greetingTimer);
+                    greetingTimer = null;
+                }
                 callSid = data.start?.callSid || data.start?.call_sid || null;
                 console.log("\uD83D\uDE80 Stream start:", streamSid);
                 practiceId = data.start?.customParameters?.practice_id || practiceId;
@@ -1872,7 +1938,11 @@ fastify.register(async (fastify) => {
                 }
                 const greeting = `${practiceSettings.name}, guten Tag. Wie kann ich helfen?`;
                 messages.push({ role: "assistant", content: greeting });
-                setTimeout(() => speak(greeting), 500);
+                greetingTimer = setTimeout(() => {
+                    greetingTimer = null;
+                    if (!callActive || handoffState.inProgress) return;
+                    void speak(greeting);
+                }, 500);
                 callStartedAt = Date.now();
                 const callLog = await createCallLog(practiceId, streamSid);
                 callLogId = callLog.id || null;
@@ -1887,6 +1957,11 @@ fastify.register(async (fastify) => {
             if (data.event === "stop") {
                 console.log("\uD83D\uDCDE Call ended");
                 callActive = false;
+                if (greetingTimer) {
+                    clearTimeout(greetingTimer);
+                    greetingTimer = null;
+                }
+                clearFirstTurnBuffer();
                 pendingTurns.length = 0;
                 if (hangupTimer) {
                     clearTimeout(hangupTimer);
@@ -1903,6 +1978,11 @@ fastify.register(async (fastify) => {
         connection.on("close", () => {
             console.log("\uD83D\uDD0C Connection closed");
             callActive = false;
+            if (greetingTimer) {
+                clearTimeout(greetingTimer);
+                greetingTimer = null;
+            }
+            clearFirstTurnBuffer();
             pendingTurns.length = 0;
             if (hangupTimer) {
                 clearTimeout(hangupTimer);
