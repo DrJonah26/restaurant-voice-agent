@@ -107,6 +107,8 @@ const DG_UTTERANCE_END_MS_LEGACY = 1000;
 const DG_ENDPOINTING_MS = Math.max(200, parsePositiveInt(process.env.DG_ENDPOINTING_MS, 550));
 const DG_UTTERANCE_END_MS = Math.max(1000, parsePositiveInt(process.env.DG_UTTERANCE_END_MS, 1000));
 const INITIAL_TURN_COALESCE_MS = parsePositiveInt(process.env.INITIAL_TURN_COALESCE_MS, 900);
+const INITIAL_TURN_FIRST_CHUNK_WAIT_MS = parsePositiveInt(process.env.INITIAL_TURN_FIRST_CHUNK_WAIT_MS, 1800);
+const INITIAL_TURN_MAX_WAIT_MS = parsePositiveInt(process.env.INITIAL_TURN_MAX_WAIT_MS, 2600);
 const MAX_LLM_HISTORY_MESSAGES = parsePositiveInt(process.env.MAX_LLM_HISTORY_MESSAGES, 18);
 const MAX_TOOL_HISTORY_MESSAGES = parsePositiveInt(process.env.MAX_TOOL_HISTORY_MESSAGES, 4);
 const TRANSCRIPT_QUEUE_RETRIES = parsePositiveInt(process.env.TRANSCRIPT_QUEUE_RETRIES, 2);
@@ -1346,7 +1348,7 @@ fastify.register(async (fastify) => {
             return hasReservationIntent;
         }
 
-        function enqueueTurn(text, sttFinalAt = Date.now()) {
+        function enqueueTurn(text, sttFinalAt = Date.now(), { isFirstTurn = false } = {}) {
             if (!text) return;
             if (pendingTurns.length >= TURN_QUEUE_MAX_SIZE) {
                 pendingTurns.shift();
@@ -1354,7 +1356,8 @@ fastify.register(async (fastify) => {
             }
             pendingTurns.push({
                 text,
-                sttFinalAt
+                sttFinalAt,
+                isFirstTurn
             });
             void processPendingTurns();
         }
@@ -1374,31 +1377,46 @@ fastify.register(async (fastify) => {
             clearFirstTurnBuffer();
             hasProcessedFirstUserTurn = true;
             if (mergedText) {
-                enqueueTurn(mergedText, sttFinalAt);
+                enqueueTurn(mergedText, sttFinalAt, { isFirstTurn: true });
             }
+        }
+
+        function scheduleFirstTurnBufferFlush(delayMs) {
+            if (!firstTurnBuffer) return;
+            if (firstTurnBuffer.timer) {
+                clearTimeout(firstTurnBuffer.timer);
+            }
+            firstTurnBuffer.timer = setTimeout(() => {
+                flushFirstTurnBuffer();
+            }, delayMs);
         }
 
         function handleIncomingFinalTranscript(cleanText) {
             if (!cleanText) return;
 
             if (!hasProcessedFirstUserTurn) {
+                const now = Date.now();
                 if (!firstTurnBuffer) {
                     firstTurnBuffer = {
                         parts: [cleanText],
-                        sttFinalAt: Date.now(),
-                        timer: null
+                        sttFinalAt: now,
+                        timer: null,
+                        startedAt: now
                     };
+                    const firstWait = Math.min(INITIAL_TURN_FIRST_CHUNK_WAIT_MS, INITIAL_TURN_MAX_WAIT_MS);
+                    scheduleFirstTurnBufferFlush(firstWait);
                 } else {
                     firstTurnBuffer.parts.push(cleanText);
-                    firstTurnBuffer.sttFinalAt = Date.now();
-                    if (firstTurnBuffer.timer) {
-                        clearTimeout(firstTurnBuffer.timer);
+                    firstTurnBuffer.sttFinalAt = now;
+                    const elapsed = Math.max(0, now - firstTurnBuffer.startedAt);
+                    const remaining = Math.max(0, INITIAL_TURN_MAX_WAIT_MS - elapsed);
+                    const delay = Math.min(INITIAL_TURN_COALESCE_MS, remaining);
+                    if (delay <= 0) {
+                        flushFirstTurnBuffer();
+                        return;
                     }
+                    scheduleFirstTurnBufferFlush(delay);
                 }
-
-                firstTurnBuffer.timer = setTimeout(() => {
-                    flushFirstTurnBuffer();
-                }, INITIAL_TURN_COALESCE_MS);
                 return;
             }
 
@@ -1676,7 +1694,7 @@ fastify.register(async (fastify) => {
                     return;
                 }
 
-                if (shouldSendQuickFiller(turn.text)) {
+                if (!turn.isFirstTurn && shouldSendQuickFiller(turn.text)) {
                     await speak(QUICK_FILLER_TEXT, { metrics });
                     await recordTranscriptEntry("assistant", QUICK_FILLER_TEXT);
                 }
