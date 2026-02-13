@@ -1063,7 +1063,7 @@ async function generateTTS(text) {
         input: { text },
         voice: {
             languageCode: "de-DE",
-            name: "de-DE-Neural2-A",
+            name: "de-DE-Chirp3-HD-Erinome",
             ssmlGender: "FEMALE"
         },
         audioConfig: {
