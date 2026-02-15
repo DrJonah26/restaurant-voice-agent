@@ -194,6 +194,7 @@ const WEEKDAY_TOKEN_MAP = {
     fri: 5,
     sat: 6
 };
+const WEEKDAY_DETECTION_REGEX = /\b(sonntag(?:s)?|montag(?:s)?|dienstag(?:s)?|mittwoch(?:s)?|donnerstag(?:s)?|freitag(?:s)?|samstag(?:s)?)\b/i;
 
 function parseClosedDaysRaw(value) {
     if (Array.isArray(value)) return value;
@@ -250,6 +251,19 @@ function normalizeClosedDays(value) {
     }
 
     return Array.from(normalized).sort((a, b) => a - b);
+}
+
+function resolveWeekdayIndexFromToken(value) {
+    const token = normalizeWeekdayToken(value);
+    if (!token) return null;
+    const direct = WEEKDAY_TOKEN_MAP[token];
+    if (Number.isInteger(direct)) return direct;
+    if (token.endsWith("s")) {
+        const withoutTrailingS = token.slice(0, -1);
+        const mapped = WEEKDAY_TOKEN_MAP[withoutTrailingS];
+        if (Number.isInteger(mapped)) return mapped;
+    }
+    return null;
 }
 
 function minutesToTimeString(minutes) {
@@ -671,7 +685,7 @@ function getConversationSignals(history, sinceIndex = 0) {
     const combined = userTexts.join(" ");
 
     const hasDate = /\b(heute|morgen|\u00fcbermorgen|uebermorgen)\b/i.test(combined) ||
-        /\b(sonntag|montag|dienstag|mittwoch|donnerstag|freitag|samstag)\b/i.test(combined) ||
+        WEEKDAY_DETECTION_REGEX.test(combined) ||
         /\b\d{1,2}\.\s?\d{1,2}\.\b/.test(combined) ||
         /\b\d{4}-\d{2}-\d{2}\b/.test(combined);
     const hasTime = /\b\d{1,2}[:.]\d{2}\b/.test(combined) ||
@@ -681,6 +695,52 @@ function getConversationSignals(history, sinceIndex = 0) {
     const hasName = /\b(ich hei(?:ss|\u00df)e|mein name ist|name ist|der name ist|auf den namen|den namen|ich bin)\b/i.test(combined);
 
     return { hasDate, hasTime, hasPartySize, hasName };
+}
+
+function getLatestPartySizeFromHistory(history) {
+    if (!Array.isArray(history)) return null;
+    for (let i = history.length - 1; i >= 0; i -= 1) {
+        const message = history[i];
+        if (message?.role !== "user") continue;
+        const extracted = extractPartySizeFromText(message.content || "");
+        if (Number.isInteger(extracted) && extracted > 0) {
+            return extracted;
+        }
+    }
+    return null;
+}
+
+function isTimeInsideWindow(targetMinutes, openMinutes, closeMinutes) {
+    if (!Number.isInteger(targetMinutes) || !Number.isInteger(openMinutes) || !Number.isInteger(closeMinutes)) {
+        return false;
+    }
+    if (closeMinutes > openMinutes) {
+        return targetMinutes >= openMinutes && targetMinutes <= closeMinutes;
+    }
+    return targetMinutes >= openMinutes || targetMinutes <= closeMinutes;
+}
+
+function sanitizeContradictoryOpeningHoursReply(text) {
+    if (!text) return text;
+
+    const betweenMatch = text.match(/zwischen\s+(\d{1,2}[:.]\d{2})\s+und\s+(\d{1,2}[:.]\d{2})\s*uhr/i);
+    const notAtMatch = text.match(/nicht\s+um\s+(\d{1,2}[:.]\d{2})\s*uhr/i);
+    if (!betweenMatch || !notAtMatch) return text;
+
+    const openMinutes = parseTimeToMinutes(betweenMatch[1]);
+    const closeMinutes = parseTimeToMinutes(betweenMatch[2]);
+    const requestedMinutes = parseTimeToMinutes(notAtMatch[1]);
+    if (!isTimeInsideWindow(requestedMinutes, openMinutes, closeMinutes)) {
+        return text;
+    }
+
+    const requestedTime = minutesToTimeString(requestedMinutes) || notAtMatch[1].replace(".", ":");
+    const openTime = minutesToTimeString(openMinutes) || betweenMatch[1].replace(".", ":");
+    const closeTime = minutesToTimeString(closeMinutes) || betweenMatch[2].replace(".", ":");
+    const dayMatch = text.match(/\bam\s+([A-Za-z\u00c4\u00d6\u00dc\u00e4\u00f6\u00fc\u00df]+)\b/i);
+    const dayPart = dayMatch ? `am ${dayMatch[1]}` : "zu dieser Zeit";
+
+    return `${requestedTime} liegt ${dayPart} innerhalb der Oeffnungszeiten von ${openTime} bis ${closeTime}. Ich pruefe die Verfuegbarkeit jetzt.`;
 }
 
 function countMissingRequired(signals) {
@@ -830,9 +890,9 @@ async function hangupCall(callSid) {
 function getWeekdayFromText(text) {
     if (!text) return null;
     const lower = text.toLowerCase();
-    const match = lower.match(/\b(sonntag|montag|dienstag|mittwoch|donnerstag|freitag|samstag)\b/);
+    const match = lower.match(WEEKDAY_DETECTION_REGEX);
     if (!match) return null;
-    return WEEKDAY_MAP[match[1]];
+    return resolveWeekdayIndexFromToken(match[1]);
 }
 
 function getNextWeekdayDate(targetWeekday, referenceDate, allowToday = false) {
@@ -1885,7 +1945,7 @@ fastify.register(async (fastify) => {
             const combined = userTexts.join(" ");
 
             const hasDate = /\b(heute|morgen|\u00fcbermorgen)\b/i.test(combined) ||
-                /\b(sonntag|montag|dienstag|mittwoch|donnerstag|freitag|samstag)\b/i.test(combined) ||
+                WEEKDAY_DETECTION_REGEX.test(combined) ||
                 /\b\d{1,2}\.\s?\d{1,2}\.\b/.test(combined) ||
                 /\b\d{4}-\d{2}-\d{2}\b/.test(combined);
             const hasTime = /\b\d{1,2}[:.]\d{2}\b/.test(combined) ||
@@ -1899,7 +1959,9 @@ fastify.register(async (fastify) => {
 
         function hasAvailabilityInputs(history, sinceIndex = 0) {
             const signals = getConversationSignals(history, sinceIndex);
-            return signals.hasDate && signals.hasTime && signals.hasPartySize;
+            const knownPartySize = getLatestPartySizeFromHistory(history);
+            const hasPartySize = signals.hasPartySize || Number.isInteger(knownPartySize);
+            return signals.hasDate && signals.hasTime && hasPartySize;
         }
 
         async function handleUserTurn(turn) {
@@ -2043,9 +2105,13 @@ fastify.register(async (fastify) => {
                 messages.push(msg);
 
                 if (msg.content) {
-                    console.log("\uD83E\uDD16 AI:", msg.content);
-                    await speak(msg.content, { metrics });
-                    await recordTranscriptEntry("assistant", msg.content);
+                    const safeContent = sanitizeContradictoryOpeningHoursReply(msg.content);
+                    if (safeContent !== msg.content) {
+                        console.warn("Corrected contradictory opening-hours reply before TTS.");
+                    }
+                    console.log("\uD83E\uDD16 AI:", safeContent);
+                    await speak(safeContent, { metrics });
+                    await recordTranscriptEntry("assistant", safeContent);
                 }
 
                 if (msg.content && shouldOfferHandoff(msg.content)) {
