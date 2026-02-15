@@ -671,6 +671,7 @@ function getConversationSignals(history, sinceIndex = 0) {
     const combined = userTexts.join(" ");
 
     const hasDate = /\b(heute|morgen|\u00fcbermorgen|uebermorgen)\b/i.test(combined) ||
+        /\b(sonntag|montag|dienstag|mittwoch|donnerstag|freitag|samstag)\b/i.test(combined) ||
         /\b\d{1,2}\.\s?\d{1,2}\.\b/.test(combined) ||
         /\b\d{4}-\d{2}-\d{2}\b/.test(combined);
     const hasTime = /\b\d{1,2}[:.]\d{2}\b/.test(combined) ||
@@ -1884,6 +1885,7 @@ fastify.register(async (fastify) => {
             const combined = userTexts.join(" ");
 
             const hasDate = /\b(heute|morgen|\u00fcbermorgen)\b/i.test(combined) ||
+                /\b(sonntag|montag|dienstag|mittwoch|donnerstag|freitag|samstag)\b/i.test(combined) ||
                 /\b\d{1,2}\.\s?\d{1,2}\.\b/.test(combined) ||
                 /\b\d{4}-\d{2}-\d{2}\b/.test(combined);
             const hasTime = /\b\d{1,2}[:.]\d{2}\b/.test(combined) ||
@@ -2012,6 +2014,9 @@ fastify.register(async (fastify) => {
                 const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
                 const forceAvailabilityTool = perfV2EnabledForCall
                     && (shouldForceAvailabilityCall(lastUserMessage?.content || "") || hasAvailabilityInputs(messages, lastAvailabilityCheckIndex));
+                if (forceAvailabilityTool) {
+                    console.log("Forcing check_availability on primary LLM call.");
+                }
                 const toolChoice = forceAvailabilityTool
                     ? { type: "function", function: { name: "check_availability" } }
                     : "auto";
@@ -2061,11 +2066,12 @@ fastify.register(async (fastify) => {
                     return;
                 }
 
-                if (!perfV2EnabledForCall && !msg.tool_calls && (shouldForceAvailabilityCall(msg.content) || hasAvailabilityInputs(messages, lastAvailabilityCheckIndex))) {
+                if (!msg.tool_calls && (shouldForceAvailabilityCall(msg.content) || hasAvailabilityInputs(messages, lastAvailabilityCheckIndex))) {
+                    console.log("Forcing check_availability via fallback LLM call.");
                     const forcedStartAt = Date.now();
                     const forcedRes = await openai.chat.completions.create({
                         model: "gpt-4o-mini",
-                        messages,
+                        messages: perfV2EnabledForCall ? trimMessagesForLLM(messages) : messages,
                         tools: [openAiTools[0]],
                         tool_choice: { type: "function", function: { name: "check_availability" } }
                     });
