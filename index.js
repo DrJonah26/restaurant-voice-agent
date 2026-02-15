@@ -113,6 +113,7 @@ const MAX_LLM_HISTORY_MESSAGES = parsePositiveInt(process.env.MAX_LLM_HISTORY_ME
 const MAX_TOOL_HISTORY_MESSAGES = parsePositiveInt(process.env.MAX_TOOL_HISTORY_MESSAGES, 4);
 const TRANSCRIPT_QUEUE_RETRIES = parsePositiveInt(process.env.TRANSCRIPT_QUEUE_RETRIES, 2);
 const TRANSCRIPT_QUEUE_BACKOFF_MS = parseBackoffDelays(process.env.TRANSCRIPT_QUEUE_BACKOFF_MS, [300, 900]);
+const RESERVATION_HANGUP_EXTRA_DELAY_MS = parsePositiveInt(process.env.RESERVATION_HANGUP_EXTRA_DELAY_MS, 2700);
 
 const ACCESS_DENIED_MESSAGES = {
     expired: "Dieses Restaurant ist derzeit nicht verf\u00fcgbar. Bitte versuchen Sie es sp\u00e4ter erneut.",
@@ -140,6 +141,26 @@ const WEEKDAY_MAP = {
     samstag: 6
 };
 const WEEKDAY_LABELS = ["Sonntag", "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag"];
+const WEEKDAY_INDEX_TO_OPENING_HOURS_KEY = [
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday"
+];
+const OPENING_HOURS_KEYS_MONDAY_FIRST = [
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday"
+];
+const OPENING_HOURS_DEFAULT_OPEN_TIME = "09:00";
+const OPENING_HOURS_DEFAULT_CLOSE_TIME = "22:00";
 const WEEKDAY_TOKEN_MAP = {
     sonntag: 0,
     montag: 1,
@@ -231,32 +252,181 @@ function normalizeClosedDays(value) {
     return Array.from(normalized).sort((a, b) => a - b);
 }
 
-function getClosedDayDetails(dateStr, closedDaysRaw) {
-    const closedDayIndexes = normalizeClosedDays(closedDaysRaw);
-    const parsedDate = parseIsoDate(dateStr);
-    if (!parsedDate) {
-        return {
-            isClosed: false,
-            requestedDayName: null,
-            closedDayNames: closedDayIndexes.map((day) => WEEKDAY_LABELS[day]),
-            otherClosedDayNames: [],
-            closedDayIndexes
+function minutesToTimeString(minutes) {
+    if (!Number.isInteger(minutes) || minutes < 0) return null;
+    const normalized = minutes % (24 * 60);
+    const hours = Math.floor(normalized / 60);
+    const mins = normalized % 60;
+    return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
+}
+
+function normalizeTimeString(value, fallback) {
+    const parsedMinutes = parseTimeToMinutes(value);
+    if (parsedMinutes === null) return fallback;
+    return minutesToTimeString(parsedMinutes) || fallback;
+}
+
+function parseOpeningHoursRaw(rawValue) {
+    if (!rawValue) return null;
+    if (typeof rawValue === "object" && !Array.isArray(rawValue)) {
+        return rawValue;
+    }
+    if (typeof rawValue !== "string") return null;
+    const trimmed = rawValue.trim();
+    if (!trimmed) return null;
+    try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            return parsed;
+        }
+    } catch {
+        return null;
+    }
+    return null;
+}
+
+function buildFallbackOpeningHoursModel(practiceSettings = {}) {
+    const closedDayIndexes = new Set(normalizeClosedDays(practiceSettings.closed_days));
+    const defaultOpenTime = normalizeTimeString(practiceSettings.opening_time, OPENING_HOURS_DEFAULT_OPEN_TIME);
+    const defaultCloseTime = normalizeTimeString(practiceSettings.closing_time, OPENING_HOURS_DEFAULT_CLOSE_TIME);
+    const model = {};
+
+    for (const dayKey of OPENING_HOURS_KEYS_MONDAY_FIRST) {
+        const weekdayIndex = WEEKDAY_INDEX_TO_OPENING_HOURS_KEY.indexOf(dayKey);
+        model[dayKey] = {
+            is_open: !closedDayIndexes.has(weekdayIndex),
+            open_time: defaultOpenTime,
+            close_time: defaultCloseTime
         };
     }
 
-    const requestedDayIndex = parsedDate.getDay();
-    const requestedDayName = WEEKDAY_LABELS[requestedDayIndex];
+    return model;
+}
+
+function normalizeDayHours(rawDay, fallbackDay) {
+    if (!rawDay || typeof rawDay !== "object") {
+        return { ...fallbackDay };
+    }
+
+    const isOpen = typeof rawDay.is_open === "boolean"
+        ? rawDay.is_open
+        : parseBoolean(rawDay.is_open, fallbackDay.is_open);
+
+    return {
+        is_open: isOpen,
+        open_time: normalizeTimeString(rawDay.open_time, fallbackDay.open_time),
+        close_time: normalizeTimeString(rawDay.close_time, fallbackDay.close_time)
+    };
+}
+
+function normalizeOpeningHoursModel(practiceSettings = {}) {
+    const fallbackModel = buildFallbackOpeningHoursModel(practiceSettings);
+    const rawOpeningHours = parseOpeningHoursRaw(practiceSettings.opening_hours);
+    if (!rawOpeningHours) return fallbackModel;
+
+    const normalizedModel = {};
+    for (const dayKey of OPENING_HOURS_KEYS_MONDAY_FIRST) {
+        normalizedModel[dayKey] = normalizeDayHours(rawOpeningHours[dayKey], fallbackModel[dayKey]);
+    }
+    return normalizedModel;
+}
+
+function getOpeningHoursForDayIndex(openingHoursModel, dayIndex) {
+    const dayKey = WEEKDAY_INDEX_TO_OPENING_HOURS_KEY[dayIndex];
+    if (!dayKey) return null;
+    return openingHoursModel?.[dayKey] || null;
+}
+
+function getClosedDayIndexesFromOpeningHours(openingHoursModel) {
+    const closedIndexes = [];
+    for (let dayIndex = 0; dayIndex <= 6; dayIndex += 1) {
+        const dayHours = getOpeningHoursForDayIndex(openingHoursModel, dayIndex);
+        if (!dayHours || !dayHours.is_open) {
+            closedIndexes.push(dayIndex);
+        }
+    }
+    return closedIndexes;
+}
+
+function getOpeningWindow(dayHours) {
+    if (!dayHours?.is_open) return null;
+    const openMinutes = parseTimeToMinutes(dayHours.open_time);
+    const closeMinutes = parseTimeToMinutes(dayHours.close_time);
+    if (openMinutes === null || closeMinutes === null) return null;
+    return {
+        openMinutes,
+        closeMinutes,
+        crossesMidnight: closeMinutes <= openMinutes
+    };
+}
+
+function formatDayHours(dayHours) {
+    if (!dayHours?.is_open) return "geschlossen";
+    return `${dayHours.open_time}-${dayHours.close_time}`;
+}
+
+function formatOpeningHoursForPrompt(openingHoursModel) {
+    const orderedDayIndexes = [1, 2, 3, 4, 5, 6, 0];
+    return orderedDayIndexes
+        .map((dayIndex) => {
+            const dayHours = getOpeningHoursForDayIndex(openingHoursModel, dayIndex);
+            return `${WEEKDAY_LABELS[dayIndex]}: ${formatDayHours(dayHours)}`;
+        })
+        .join("\n");
+}
+
+function getOpeningHoursStatus(dateStr, time, openingHoursModel) {
+    const closedDayIndexes = getClosedDayIndexesFromOpeningHours(openingHoursModel);
     const closedDayNames = closedDayIndexes.map((day) => WEEKDAY_LABELS[day]);
+    const requestedDate = parseIsoDate(dateStr);
+    const requestedMinutes = parseTimeToMinutes(time);
+
+    if (!requestedDate || requestedMinutes === null) {
+        return {
+            isOpenAtRequestedTime: true,
+            isClosedDay: false,
+            requestedDayName: requestedDate ? WEEKDAY_LABELS[requestedDate.getDay()] : null,
+            requestedDayHours: null,
+            requestedDayHoursLabel: null,
+            closedDayNames,
+            otherClosedDayNames: closedDayNames,
+            opensViaPreviousDay: false
+        };
+    }
+
+    const requestedDayIndex = requestedDate.getDay();
+    const requestedDayName = WEEKDAY_LABELS[requestedDayIndex];
+    const requestedDayHours = getOpeningHoursForDayIndex(openingHoursModel, requestedDayIndex);
+    const previousDayIndex = (requestedDayIndex + 6) % 7;
+    const previousDayHours = getOpeningHoursForDayIndex(openingHoursModel, previousDayIndex);
+
+    const requestedWindow = getOpeningWindow(requestedDayHours);
+    const previousWindow = getOpeningWindow(previousDayHours);
+
+    const inRequestedDayWindow = requestedWindow
+        ? (requestedWindow.crossesMidnight
+            ? requestedMinutes >= requestedWindow.openMinutes
+            : requestedMinutes >= requestedWindow.openMinutes && requestedMinutes < requestedWindow.closeMinutes)
+        : false;
+
+    const inPreviousDayCarryOver = previousWindow?.crossesMidnight
+        ? requestedMinutes < previousWindow.closeMinutes
+        : false;
+
+    const isOpenAtRequestedTime = inRequestedDayWindow || inPreviousDayCarryOver;
     const otherClosedDayNames = closedDayIndexes
         .filter((day) => day !== requestedDayIndex)
         .map((day) => WEEKDAY_LABELS[day]);
 
     return {
-        isClosed: closedDayIndexes.includes(requestedDayIndex),
+        isOpenAtRequestedTime,
+        isClosedDay: !requestedDayHours?.is_open,
         requestedDayName,
+        requestedDayHours,
+        requestedDayHoursLabel: formatDayHours(requestedDayHours),
         closedDayNames,
         otherClosedDayNames,
-        closedDayIndexes
+        opensViaPreviousDay: inPreviousDayCarryOver && !inRequestedDayWindow
     };
 }
 
@@ -711,18 +881,26 @@ function buildSystemMessage(practiceSettings) {
         d.setDate(d.getDate() + i + 1);
         return `${d.toLocaleDateString("de-DE", { weekday: "long" })}: ${d.toISOString().split("T")[0]}`;
     }).join("\n");
-    const openingTime = formatTime(practiceSettings.opening_time);
-    const closingTime = formatTime(practiceSettings.closing_time);
-    const closedDayIndexes = normalizeClosedDays(practiceSettings.closed_days);
+    const openingHoursModel = normalizeOpeningHoursModel(practiceSettings);
+    const openingTime = formatTime(practiceSettings.opening_time) || OPENING_HOURS_DEFAULT_OPEN_TIME;
+    const closingTime = formatTime(practiceSettings.closing_time) || OPENING_HOURS_DEFAULT_CLOSE_TIME;
+    const closedDayIndexes = getClosedDayIndexesFromOpeningHours(openingHoursModel);
     const closedDaysSummary = closedDayIndexes.length > 0
         ? closedDayIndexes.map((day) => WEEKDAY_LABELS[day]).join(", ")
         : "Keine";
+    const openingHoursByDaySummary = formatOpeningHoursForPrompt(openingHoursModel);
+    const todayHours = getOpeningHoursForDayIndex(openingHoursModel, today.getDay());
+    const todayHoursLabel = formatDayHours(todayHours);
+
     return (
         SYSTEM_MESSAGE_TEMPLATE
             .replaceAll("{{restaurant_name}}", practiceSettings.name)
             .replaceAll("{{opening_time}}", openingTime)
             .replaceAll("{{closing_time}}", closingTime) +
-        `\nGESCHLOSSENE TAGE: ${closedDaysSummary}\n` +
+        `\nOEFFNUNGSZEITEN PRO TAG:\n${openingHoursByDaySummary}\n` +
+        `HINWEIS: Schliesszeit <= Oeffnungszeit bedeutet geoeffnet bis nach Mitternacht.\n` +
+        `\nHEUTE GEPLANTE OEFFNUNGSZEITEN: ${todayHoursLabel}\n` +
+        `GESCHLOSSENE TAGE: ${closedDaysSummary}\n` +
         `\nHEUTIGES DATUM: ${todayStr} (${weekdayName})\n\n` +
         `WICHTIG - WOCHENTAGE RICHTIG INTERPRETIEREN:\n` +
         `Wenn der Kunde einen Wochentag nennt, nutze diese Zuordnung:\n${next7Days}\n\n` +
@@ -731,6 +909,9 @@ function buildSystemMessage(practiceSettings) {
         `sage klar, dass das Restaurant am angefragten Tag geschlossen ist,\n` +
         `nenne auch die weiteren geschlossenen Tage aus other_closed_days (falls vorhanden)\n` +
         `und frage direkt nach einem neuen Termin.\n\n` +
+        `WICHTIG: Wenn ein Tool-Ergebnis is_outside_opening_hours=true zurueckgibt,\n` +
+        `sage die Oeffnungszeit fuer requested_day_opening_hours\n` +
+        `und frage direkt nach einer Uhrzeit innerhalb dieses Zeitfensters.\n\n` +
         `REGEL: Wenn der Kunde nach Verf\u00fcgbarkeit fragt, rufe SOFORT 'check_availability' auf. Frage nicht "Soll ich nachsehen?", sondern mach es einfach.\n` +
         `Antworte kurz und pr\u00e4gnant. Wenn Uhrzeiten ohne Doppelpunkt erkannt werden (z.B. "18 30"),\n` +
         `wandle sie IMMER in das Format HH:MM um (z.B. "18:30"),\n` +
@@ -820,30 +1001,51 @@ async function checkPracticeAccess(practiceId) {
 
 /* --------------------- DB FUNCTIONS --------------------- */
 
-async function checkAvailability(date, time, partySize, maxCapacity, practiceId, closedDaysRaw) {
+async function checkAvailability(date, time, partySize, practiceSettings) {
     console.log(`\uD83D\uDD0E DB CHECK: ${date} ${time} (${partySize} Pers)`);
     if (isPastDate(date)) {
         console.warn(`\u26A0\uFE0F Past date rejected: ${date}`);
         return { available: false, error: "Past date" };
-    }
-    const closedDayDetails = getClosedDayDetails(date, closedDaysRaw);
-    if (closedDayDetails.isClosed) {
-        console.warn(`\u26A0\uFE0F Closed day rejected: ${date} (${closedDayDetails.requestedDayName})`);
-        return {
-            available: false,
-            error: "Closed day",
-            is_closed_day: true,
-            requested_day: closedDayDetails.requestedDayName,
-            closed_days: closedDayDetails.closedDayNames,
-            other_closed_days: closedDayDetails.otherClosedDayNames,
-            prompt_user_for_new_date: true
-        };
     }
     const requestedStart = parseTimeToMinutes(time);
     if (requestedStart === null) {
         console.warn(`Invalid time rejected: ${time}`);
         return { available: false, error: "Invalid time" };
     }
+
+    const openingHoursModel = normalizeOpeningHoursModel(practiceSettings);
+    const openingStatus = getOpeningHoursStatus(date, time, openingHoursModel);
+    const openingHoursByDay = formatOpeningHoursForPrompt(openingHoursModel);
+    if (!openingStatus.isOpenAtRequestedTime) {
+        if (openingStatus.isClosedDay) {
+            console.warn(`\u26A0\uFE0F Closed day rejected: ${date} (${openingStatus.requestedDayName})`);
+            return {
+                available: false,
+                error: "Closed day",
+                is_closed_day: true,
+                requested_day: openingStatus.requestedDayName,
+                requested_day_opening_hours: openingStatus.requestedDayHoursLabel,
+                closed_days: openingStatus.closedDayNames,
+                other_closed_days: openingStatus.otherClosedDayNames,
+                opening_hours_by_day: openingHoursByDay,
+                prompt_user_for_new_date: true
+            };
+        }
+
+        console.warn(`\u26A0\uFE0F Outside opening hours rejected: ${date} ${time} (${openingStatus.requestedDayName})`);
+        return {
+            available: false,
+            error: "Outside opening hours",
+            is_outside_opening_hours: true,
+            requested_day: openingStatus.requestedDayName,
+            requested_day_opening_hours: openingStatus.requestedDayHoursLabel,
+            opening_hours_by_day: openingHoursByDay,
+            prompt_user_for_new_time: true
+        };
+    }
+
+    const maxCapacity = Number(practiceSettings?.max_capacity) || 0;
+    const practiceId = practiceSettings?.id;
     const { data, error } = await supabase
         .from("reservations")
         .select("party_size, time")
@@ -930,25 +1132,49 @@ async function notifyReservationCreatedWithRetry(reservationId) {
     return { success: false, retryable: true, error: lastErrorMessage };
 }
 
-async function createReservation(date, time, partySize, name, practiceId, phoneNumber, closedDaysRaw) {
+async function createReservation(date, time, partySize, name, practiceSettings, phoneNumber) {
     console.log(`\uD83D\uDCDD RESERVIERUNG: ${name}, ${date}, ${time}`);
     if (isPastDate(date)) {
         console.warn(`\u26A0\uFE0F Past date rejected: ${date}`);
         return { success: false, error: "Past date" };
     }
-    const closedDayDetails = getClosedDayDetails(date, closedDaysRaw);
-    if (closedDayDetails.isClosed) {
-        console.warn(`\u26A0\uFE0F Closed day reservation rejected: ${date} (${closedDayDetails.requestedDayName})`);
+    if (parseTimeToMinutes(time) === null) {
+        console.warn(`Invalid reservation time rejected: ${time}`);
+        return { success: false, error: "Invalid time" };
+    }
+
+    const openingHoursModel = normalizeOpeningHoursModel(practiceSettings);
+    const openingStatus = getOpeningHoursStatus(date, time, openingHoursModel);
+    const openingHoursByDay = formatOpeningHoursForPrompt(openingHoursModel);
+    if (!openingStatus.isOpenAtRequestedTime) {
+        if (openingStatus.isClosedDay) {
+            console.warn(`\u26A0\uFE0F Closed day reservation rejected: ${date} (${openingStatus.requestedDayName})`);
+            return {
+                success: false,
+                error: "Closed day",
+                is_closed_day: true,
+                requested_day: openingStatus.requestedDayName,
+                requested_day_opening_hours: openingStatus.requestedDayHoursLabel,
+                closed_days: openingStatus.closedDayNames,
+                other_closed_days: openingStatus.otherClosedDayNames,
+                opening_hours_by_day: openingHoursByDay,
+                prompt_user_for_new_date: true
+            };
+        }
+
+        console.warn(`\u26A0\uFE0F Reservation outside opening hours rejected: ${date} ${time} (${openingStatus.requestedDayName})`);
         return {
             success: false,
-            error: "Closed day",
-            is_closed_day: true,
-            requested_day: closedDayDetails.requestedDayName,
-            closed_days: closedDayDetails.closedDayNames,
-            other_closed_days: closedDayDetails.otherClosedDayNames,
-            prompt_user_for_new_date: true
+            error: "Outside opening hours",
+            is_outside_opening_hours: true,
+            requested_day: openingStatus.requestedDayName,
+            requested_day_opening_hours: openingStatus.requestedDayHoursLabel,
+            opening_hours_by_day: openingHoursByDay,
+            prompt_user_for_new_time: true
         };
     }
+
+    const practiceId = practiceSettings?.id;
     const { data, error } = await supabase
         .from("reservations")
         .insert({
@@ -1207,7 +1433,7 @@ fastify.register(async (fastify) => {
                 type: "function",
                 function: {
                     name: "check_availability",
-                    description: "Pr\u00fcft ob ein Tisch frei ist.",
+                    description: "Prueft, ob ein Tisch frei ist und ob der Termin in den Oeffnungszeiten des jeweiligen Wochentags liegt.",
                     parameters: {
                         type: "object",
                         properties: {
@@ -1223,7 +1449,7 @@ fastify.register(async (fastify) => {
                 type: "function",
                 function: {
                     name: "create_reservation",
-                    description: "Legt eine Reservierung an.",
+                    description: "Legt eine Reservierung an, wenn der Termin in den Oeffnungszeiten liegt.",
                     parameters: {
                         type: "object",
                         properties: {
@@ -1512,10 +1738,10 @@ fastify.register(async (fastify) => {
         }
 
         function estimateSpeechDurationMs(text) {
-            if (!text) return 2200;
+            if (!text) return 4500 + RESERVATION_HANGUP_EXTRA_DELAY_MS;
             const words = String(text).trim().split(/\s+/).filter(Boolean).length;
-            const estimated = words * 360 + 1200;
-            return Math.max(2200, Math.min(10000, estimated));
+            const estimated = words * 360 + 1200 + RESERVATION_HANGUP_EXTRA_DELAY_MS;
+            return Math.max(4500, Math.min(15000, estimated));
         }
 
         function scheduleReservationCompletionHangup(lastAssistantText) {
@@ -1739,9 +1965,7 @@ fastify.register(async (fastify) => {
                         resolvedDate,
                         args.time,
                         args.party_size,
-                        practiceSettings.max_capacity,
-                        practiceSettings.id,
-                        practiceSettings.closed_days
+                        practiceSettings
                     );
                 } else if (tool.function.name === "create_reservation") {
                     const resolvedDate = resolveWeekdayDate(args.date, lastUserMessage?.content || "");
@@ -1750,9 +1974,8 @@ fastify.register(async (fastify) => {
                         args.time,
                         args.party_size,
                         args.name,
-                        practiceSettings.id,
-                        callerPhone,
-                        practiceSettings.closed_days
+                        practiceSettings,
+                        callerPhone
                     );
                     if (result?.success) {
                         callEndState.shouldHangupAfterAssistantReply = true;
